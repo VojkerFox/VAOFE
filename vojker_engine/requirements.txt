@@ -1,0 +1,7 @@
+﻿jax[cpu]
+jaxlib
+optax
+pandas
+psycopg2-binary
+MetaTrader5
+python-dotenv
