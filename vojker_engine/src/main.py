@@ -16,6 +16,11 @@ from src.compute.delta_calc import DeltaEngine
 from src.compute.liquidity_density import LiquidityDensityEngine
 from src.compute.trend_engine import TrendEngine
 from src.compute.wick_detector import WickScanner
+from src.notify.telegram_bot import TelegramNotifier
+
+# TUODAAN MOLEMMAT JAX-KINEETTISET MOOTTORIT (Inertia & Synteettinen DOM)
+from flow_analytics import calculate_triad_inertia, calculate_synthetic_dom
+
 
 # --- ASETUKSET ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -26,7 +31,7 @@ PAIRS = [
     "GOLD", "SILVER", "US_30"
 ]
 
-ACTIVE_TIMEFRAME = mt5.TIMEFRAME_M15
+ACTIVE_TIMEFRAME = mt5.TIMEFRAME_M30
 CHECK_INTERVAL_SECONDS = 5 
 
 DB_CONFIG = {
@@ -49,7 +54,7 @@ def get_pip_size(pair):
     if "US30" in pair or "SPX" in pair or "NAS" in pair or "US_30" in pair: return 1.0
     return 0.0001
 
-def save_to_db(pair, predicted, actual, friction, loss, volume, macd_hist, wick_signal, wick_pct):
+def save_to_db(pair, predicted, actual, friction, loss, volume, macd_hist, wick_signal, wick_pct, dom_imbalance):
     if not db_pool: return
     conn = None
     try:
@@ -57,9 +62,9 @@ def save_to_db(pair, predicted, actual, friction, loss, volume, macd_hist, wick_
         cur = conn.cursor()
         cur.execute(
             """INSERT INTO ai_learning_logs 
-            (pair, predicted_pips, actual_pips, friction_weight, loss, volume, macd_hist, wick_signal, wick_pct) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (pair, predicted, actual, friction, loss, volume, macd_hist, wick_signal, wick_pct)
+            (pair, predicted_pips, actual_pips, friction_weight, loss, volume, macd_hist, wick_signal, wick_pct, dom_imbalance) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (pair, predicted, actual, friction, loss, volume, macd_hist, wick_signal, wick_pct, dom_imbalance)
         )
         conn.commit()
         cur.close()
@@ -89,13 +94,42 @@ def hae_order_flow_stats(pair):
     delta = float(DeltaEngine.calculate_delta(bid_vol, ask_vol))
     return {"volume": volume, "delta": delta}
 
+def hae_l2_dom_imbalance(pair):
+    """
+    Hakee reaaliaikaisen Level 2 Depth of Market snapshotin ja laskee JAXilla tilauskirjan epätasapainon.
+    Palauttaa arvon väliltä -1.0 (täysi myyntiseinä) ... +1.0 (täysi ostoseinä).
+    """
+    book = mt5.market_book_get(pair)
+    if book is None or len(book) == 0:
+        return None
+        
+    bids_vol = []
+    asks_vol = []
+    
+    for item in book:
+        # MT5 tyypit: 1 = BOOK_TYPE_SELL (Asks), 2 = BOOK_TYPE_BUY (Bids)
+        if item.type == 1:
+            asks_vol.append(float(item.volume))
+        elif item.type == 2:
+            bids_vol.append(float(item.volume))
+            
+    if not bids_vol or not asks_vol:
+        return None
+        
+    # Muutetaan JAX-tensoreiksi ja ajetaan valmis L2-analyysi
+    bids_arr = jnp.array(bids_vol, dtype=jnp.float32)
+    asks_arr = jnp.array(asks_vol, dtype=jnp.float32)
+    
+    l2_score = float(LiquidityDensityEngine.analyze_l2_imbalance(bids_arr, asks_arr))
+    return l2_score
+
 def start_live_engine():
-    print(f"🚀 VAOFE SciML Moottori käynnistyy (Täysi konfluenssi-ajon alustus)...")
+    print(f"🚀 VAOFE SciML Moottori käynnistyy (Hybrid JAX-DOM & M30 MACD Crossover)...")
     if not mt5.initialize():
         print("❌ MT5 alustus epäonnistui!")
         return
 
-    # FAIL-SAFE: Varmistetaan lennosta että tietokannassa on paikat uusille tiedoille
+    # FAIL-SAFE: Varmistetaan että tietokanta tukee reaaliaikaista L2 DOM -tiedonkeruuta
     if db_pool:
         try:
             conn = db_pool.getconn()
@@ -104,17 +138,29 @@ def start_live_engine():
             cur.execute("ALTER TABLE ai_learning_logs ADD COLUMN IF NOT EXISTS macd_hist NUMERIC;")
             cur.execute("ALTER TABLE ai_learning_logs ADD COLUMN IF NOT EXISTS wick_signal NUMERIC;")
             cur.execute("ALTER TABLE ai_learning_logs ADD COLUMN IF NOT EXISTS wick_pct NUMERIC;")
+            cur.execute("ALTER TABLE ai_learning_logs ADD COLUMN IF NOT EXISTS dom_imbalance NUMERIC;")
             conn.commit()
             cur.close()
             db_pool.putconn(conn)
-            print("✅ Tietokantarakenne varmistettu ja päivitetty onnistuneesti.")
+            print("✅ Tietokantarakenne ja L2-sarakkeet varmistettu onnistuneesti.")
         except Exception as e:
             print(f"⚠️ Huomautus tietokannan tarkistuksesta: {e}")
 
+    # Rekisteröidään ja tilataan L2 tilauskirjavirta MT5:stä kaikille seuratuille pareille
+    for pair in PAIRS:
+        if mt5.market_book_add(pair):
+            print(f"   📊 L2 DOM -tilauskirjavirta aktivoitu: {pair}")
+        else:
+            print(f"   ⚠️ Broker ei tarjoa aitoa DOM-dataa: {pair} -> Kytketään Kineettinen Synteettinen JAX-DOM (Kyle's Lambda).")
+
     ai_engines = {pair: LiquidityDensityEngine(learning_rate=0.05) for pair in PAIRS}
     ai_states = {pair: (ai_engines[pair].params, ai_engines[pair].opt_state) for pair in PAIRS}
+    
+    notifier = TelegramNotifier()
+    last_wick_alert = {pair: 0 for pair in PAIRS}
+    last_macd_alert = {pair: 0 for pair in PAIRS}
 
-    print("✅ Moottori alustettu livenä. Seurataan tilausvirtaa ja kynttilägeometriaa...")
+    print("✅ Moottori alustettu LIVENÄ. Seurataan aitoja muureja sekä M30 MACD-käännöksiä...")
 
     while True:
         try:
@@ -122,7 +168,6 @@ def start_live_engine():
                 if not mt5.symbol_select(pair, True):
                     continue
                 
-                # Haetaan riittävästi kynttilöitä (100 kpl) vakaata MACD-laskentaa varten
                 rates = mt5.copy_rates_from_pos(pair, ACTIVE_TIMEFRAME, 0, 100)
                 if rates is None or len(rates) < 50: 
                     continue
@@ -132,22 +177,49 @@ def start_live_engine():
                     pip_size = get_pip_size(pair)
                     actual_pips = (rates[-1]['close'] - rates[-1]['open']) / pip_size
                     
-                    # 1. Ajetaan MACD-laskenta livenä
+                    # 1. Ajetaan MACD-laskenta
                     closes = [float(r['close']) for r in rates]
                     _, _, histogram = TrendEngine.calculate_macd_all(closes)
                     latest_macd = float(histogram[-1])
                     
-                    # 2. Ajetaan institutionaalinen hännän hylkäysskanneri (Sweep)
-                    open_p, high_p, low_p, close_p = rates[-1]['open'], rates[-1]['high'], rates[-1]['low'], rates[-1]['close']
-                    wick_signal, wick_pct = WickScanner.detect_rejection(open_p, high_p, low_p, close_p)
+                    # 2. Ajetaan hylkäysskanneri SULKEUTUNEELLE kynttilälle (rates[-2])
+                    closed_candle = rates[-2]
+                    closed_bar_time = int(closed_candle['time'])
+                    wick_signal, wick_pct = WickScanner.detect_rejection(
+                        closed_candle['open'], closed_candle['high'], closed_candle['low'], closed_candle['close']
+                    )
+                    
+                    # Varmistetaan MACD-risteys sulkeutuneista kynttilöistä (rates[-2] vs rates[-3])
+                    closed_macd = float(histogram[-2])
+                    prev_closed_macd = float(histogram[-3])
+                    
+                    macd_crossed_bullish = (prev_closed_macd < 0 and closed_macd >= 0)
+                    macd_crossed_bearish = (prev_closed_macd > 0 and closed_macd <= 0)
+                    
+                    # 3. LUETAAN TAI LASKETAAN HYBRID-DOM (Aito Level 2 TAI Synteettinen Kyle's Lambda)
+                    l2_imbalance = hae_l2_dom_imbalance(pair)
+                    
+                    if l2_imbalance is not None:
+                        unified_dom_imbalance = float(l2_imbalance)
+                        stiffness_val = 0.0 
+                        l2_status_str = f"Aito L2 DOM: {unified_dom_imbalance:+.4f}"
+                    else:
+                        synthetic_imbalance, stiffness = calculate_synthetic_dom(
+                            jnp.array(of["delta"], dtype=jnp.float32),
+                            jnp.array(of["volume"], dtype=jnp.float32),
+                            jnp.array(actual_pips, dtype=jnp.float32)
+                        )
+                        unified_dom_imbalance = float(synthetic_imbalance)
+                        stiffness_val = float(stiffness)
+                        l2_status_str = f"Synth DOM: {unified_dom_imbalance:+.4f} (Stiff: {stiffness_val:.1f})"
+                    
+                    imbalance = unified_dom_imbalance
                     
                     params, opt_state = ai_states[pair]
                     cost_per_pip = LiquidityDensityEngine.calculate_cost_per_pip(
                         jnp.array([rates[-1]['high']]), jnp.array([rates[-1]['low']]), 
                         jnp.array([of["volume"]]), pip_size
                     )[0]
-                    
-                    imbalance = of["delta"] / (of["volume"] + 1e-7)
                     
                     predicted = LiquidityDensityEngine.predict_movement(params, imbalance, cost_per_pip, of["volume"])
                     new_params, new_opt_state, loss = ai_engines[pair].update_learning(
@@ -161,9 +233,60 @@ def start_live_engine():
                     # TALLENNETAAN KAIKKI TIEDOT KANTAAN
                     save_to_db(
                         db_pair_name, float(predicted), float(actual_pips), float(friction_val), 
-                        float(loss), float(of["volume"]), latest_macd, float(wick_signal), float(wick_pct)
+                        float(loss), float(of["volume"]), latest_macd, float(wick_signal), float(wick_pct),
+                        unified_dom_imbalance
                     )
-                    print(f"🧠 [{pair}] Live | Kitka: {friction_val:.4f} | MACD Hist: {latest_macd:.6f} | Wick: {wick_signal} ({wick_pct:.1f}%)")
+                    
+                    inertia_val = float(calculate_triad_inertia(float(of["volume"]), latest_macd, friction_val))
+                    
+                    print(f"🧠 [{pair}] Live | {l2_status_str} | MACD: {latest_macd:.6f} | Wick: {wick_signal}")
+                    
+                    stiffness_text = f"\n🏋️ *Seinän kireys (Stiffness):* {stiffness_val:.1f}" if l2_imbalance is None else ""
+                    
+                    # --- HÄLYTYS A: WICK PYYHKÄISY ---
+                    if wick_signal != 0.0 and last_wick_alert[pair] != closed_bar_time:
+                        l2_confirmed = True
+                        if wick_signal == -1.0 and unified_dom_imbalance > 0.4: l2_confirmed = False  
+                        if wick_signal == 1.0 and unified_dom_imbalance < -0.4: l2_confirmed = False  
+                        
+                        if l2_confirmed:
+                            last_wick_alert[pair] = closed_bar_time
+                            suunta_emoji = "🟢 LONG" if wick_signal == 1.0 else "🔴 SHORT"
+                            
+                            alert_msg = (
+                                f"🎯 *VOJKER L2 CONFLUENCE ALERT: {pair}*\n\n"
+                                f"⚡ *Rakenne:* {suunta_emoji} (Hylkäys: {wick_pct:.1f}%)\n"
+                                f"📊 *Tilauskirjan paine:* {unified_dom_imbalance:+.4f} {'(Synteettinen)' if l2_imbalance is None else '(Aito L2)'}{stiffness_text}\n"
+                                f"🎛️ *Kitkakerroin:* {friction_val:.4f}\n"
+                                f"⛓️ *Inertia-indeksi:* {inertia_val:.2f}\n"
+                                f"📈 *MACD Histogram:* {latest_macd:.6f}\n\n"
+                                f"💡 _Mekaaninen triangeli lukittu JA tilauskirjan seinillä vahvistettu. Ansat suodatettu._"
+                            )
+                            notifier.send_alert(alert_msg)
+                        else:
+                            print(f"🛡️ [VAOFE SUOJAUS] {pair} Wick-signaali peruttu! Stop-Hunt ansa havaittu.")
+                            
+                    # --- HÄLYTYS B: M30 MACD VÄRINVAIHTO ---
+                    if (macd_crossed_bullish or macd_crossed_bearish) and last_macd_alert[pair] != closed_bar_time:
+                        l2_confirmed = True
+                        if macd_crossed_bearish and unified_dom_imbalance > 0.4: l2_confirmed = False
+                        if macd_crossed_bullish and unified_dom_imbalance < -0.4: l2_confirmed = False
+                        
+                        if l2_confirmed:
+                            last_macd_alert[pair] = closed_bar_time
+                            suunta_emoji = "🟢 LONG (Vihreä)" if macd_crossed_bullish else "🔴 SHORT (Punainen)"
+                            
+                            alert_msg = (
+                                f"📈 *VOJKER MACD M30 VÄRINVAIHTO: {pair}*\n\n"
+                                f"⚡ *Momentum Kääntyi:* {suunta_emoji}\n"
+                                f"📊 *Tilauskirjan paine:* {unified_dom_imbalance:+.4f} {'(Synteettinen)' if l2_imbalance is None else '(Aito L2)'}{stiffness_text}\n"
+                                f"🎛️ *Kitkakerroin:* {friction_val:.4f}\n"
+                                f"⛓️ *Inertia-indeksi:* {inertia_val:.2f}\n\n"
+                                f"💡 _MACD (M30) on vaihtanut värin nollalinjan yli. Jos olet odottanut vahvistusta treidille, se on tässä._"
+                            )
+                            notifier.send_alert(alert_msg)
+                        else:
+                            print(f"🛡️ [VAOFE SUOJAUS] {pair} MACD-värivaihto peruttu! Tilauskirjan seinä ei tue käännöstä.")
             
             time.sleep(CHECK_INTERVAL_SECONDS)
         except Exception as e:
