@@ -1,8 +1,20 @@
+import os
 import time
+import requests
 import MetaTrader5 as mt5
+from dotenv import load_dotenv
 
-# --- 1. SYÖTETYT TASOT JA SYMBOLIMAPPPING ---
-# Huom: Muuta tarvittaessa oikeanpuoleiset nimet vastaamaan välittäjäsi (broker) symboleita (esim. 'GOLD' tai 'BTCUSD')
+# --- LADOOTAAN YMPÄRISTÖMUUTTUJAT .ENV TIEDOSTOSTA ---
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Pieni varmistus kehittäjälle, että muuttujat oikeasti löytyivät
+if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    print("❌ VIRHE: TELEGRAM_TOKEN tai TELEGRAM_CHAT_ID puuttuu .env-tiedostosta!")
+    exit(1)
+
 LEVELS = {
     "EURUSD": {"symbol": "EURUSD", "buy_above": 1.15906, "sell_below": 1.15900},
     "GBPUSD": {"symbol": "GBPUSD", "buy_above": 1.34175, "sell_below": 1.33230},
@@ -20,60 +32,78 @@ LEVELS = {
     "BTC":    {"symbol": "BTCUSD", "buy_above": 64172.10, "sell_below": 60713.41}
 }
 
-# Tilanhallinta, ettei skripti huuda jokaisella tickillä uudestaan
 alert_history = {key: {"buy_triggered": False, "sell_triggered": False} for key in LEVELS}
 
-def trigger_walker_alert(display_name, order_type, price, target_level):
+def send_telegram_alert(display_name, order_type, price, target_level):
     """
-    Tämä funktio laukaisee hälytyksen. Tähän voit myöhemmin integroida 
-    sen aiemmin suunnitellun Check-list -promptin tai Telegram-botin.
+    Muotoilee ja lähettää premium-tason Markdown-viestin suoraan Telegramiin.
     """
-    print("\n" + "="*60)
-    print(f"🚨 MR. WALKER ML ALERT: {display_name} 🚨")
-    print(f"Suunta: {order_type.upper()}")
-    print(f"Nykyinen hinta: {price}")
-    print(f"Rikottu taso: {target_level}")
-    print("="*60 + "\n")
+    emoji = "🟢" if "OSTO" in order_type else "🔴"
+    
+    message = (
+        f"🦅 *MR. WALKER ML – REALTIME ALERT* 🦅\n"
+        f"-----------------------------------------\n"
+        f"📊 *Instrument:* {display_name}\n"
+        f"{emoji} *Action:* {order_type}\n"
+        f"💵 *Current Price:* `{price}`\n"
+        f"🎯 *Triggered Level:* `{target_level}`\n"
+        f"-----------------------------------------\n"
+        f"⚠️ *REMINDER – RUN YOUR CHECKLIST:*\n"
+        f"1. High Impact News upcoming?\n"
+        f"2. Price at true S/R boundary?\n"
+        f"3. Wait for M15 Break & Retest confirmation!\n"
+        f"4. Is there enough room to the next H1 level?"
+    )
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    
+    try:
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            print(f"✅ Telegram-hälytys lähetetty parille {display_name}")
+        else:
+            print(f"❌ Telegram-virhe: {response.text}")
+    except Exception as e:
+        print(f"❌ Yhteysvirhe Telegramiin: {e}")
 
 def main():
-    # Alustetaan yhteys MT5-terminaaliin
     if not mt5.initialize():
-        print("MT5 alustus epäonnistui. Varmista, että MT5-alusta on auki koneella.")
+        print("MT5 alustus epäonnistui.")
         return
     
-    print("Mr. Walker ML Alerter aktivoitu. Seurataan 14 instrumenttia...")
+    print("Mr. Walker ML Alerter aktivoitu live-Telegram -syötteellä (.env ladattu).")
     
     try:
         while True:
             for name, config in LEVELS.items():
                 mt5_symbol = config["symbol"]
-                
-                # Haetaan viimeisin tick-data terminaalista
                 tick = mt5.symbol_info_tick(mt5_symbol)
                 if tick is None:
                     continue
                 
                 current_price = tick.last if tick.last != 0 else tick.bid
                 
-                # OSTO-tason tarkistus (Price > buy_above)
+                # OSTO
                 if current_price > config["buy_above"]:
                     if not alert_history[name]["buy_triggered"]:
-                        trigger_walker_alert(name, "OSTO (Buy Above)", current_price, config["buy_above"])
+                        send_telegram_alert(name, "OSTO (Buy Above)", current_price, config["buy_above"])
                         alert_history[name]["buy_triggered"] = True
                 else:
-                    # Nollataan hälytysvalmius, jos hinta palaa laatikon sisälle
                     alert_history[name]["buy_triggered"] = False
                 
-                # MYYNTI-tason tarkistus (Price < sell_below)
+                # MYYNTI
                 if current_price < config["sell_below"]:
                     if not alert_history[name]["sell_triggered"]:
-                        trigger_walker_alert(name, "MYYNTI (Sell Below)", current_price, config["sell_below"])
+                        send_telegram_alert(name, "MYYNTI (Sell Below)", current_price, config["sell_below"])
                         alert_history[name]["sell_triggered"] = True
                 else:
-                    # Nollataan hälytysvalmius, jos hinta palaa laatikon sisälle
                     alert_history[name]["sell_triggered"] = False
             
-            # Kevyt lepotila (0.5 sekuntia), ettei prosessori käy kuumana
             time.sleep(0.5)
             
     except KeyboardInterrupt:
