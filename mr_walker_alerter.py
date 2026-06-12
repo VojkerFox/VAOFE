@@ -4,15 +4,18 @@ import requests
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
 
-# --- LADOOTAAN YMPÄRISTÖMUUTTUJAT .ENV TIEDOSTOSTA ---
+# --- LADATAAN YMPÄRISTÖMUUTTUJAT .ENV TIEDOSTOSTA ---
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Haetaan tunnukset tismalleen sinun .env-tiedostosi avaimilla
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+raw_chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-# Pieni varmistus kehittäjälle, että muuttujat oikeasti löytyivät
+# SIISTIMINEN: Poistetaan heittomerkit (') ja mahdolliset lainausmerkit tai välilyönnit kooditasolla
+TELEGRAM_CHAT_ID = raw_chat_id.strip("'\" ") if raw_chat_id else None
+
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    print("❌ VIRHE: TELEGRAM_TOKEN tai TELEGRAM_CHAT_ID puuttuu .env-tiedostosta!")
+    print("❌ VIRHE: TELEGRAM_BOT_TOKEN tai TELEGRAM_CHAT_ID puuttuu .env-tiedostosta!")
     exit(1)
 
 LEVELS = {
@@ -35,9 +38,6 @@ LEVELS = {
 alert_history = {key: {"buy_triggered": False, "sell_triggered": False} for key in LEVELS}
 
 def send_telegram_alert(display_name, order_type, price, target_level):
-    """
-    Muotoilee ja lähettää premium-tason Markdown-viestin suoraan Telegramiin.
-    """
     emoji = "🟢" if "OSTO" in order_type else "🔴"
     
     message = (
@@ -76,7 +76,7 @@ def main():
         print("MT5 alustus epäonnistui.")
         return
     
-    print("Mr. Walker ML Alerter aktivoitu live-Telegram -syötteellä (.env ladattu).")
+    print("Mr. Walker ML Alerter aktivoitu live-Telegram -syötteellä (Kooditason .env-fiksi käytössä).")
     
     try:
         while True:
