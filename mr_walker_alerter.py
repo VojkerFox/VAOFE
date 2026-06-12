@@ -5,18 +5,22 @@ import MetaTrader5 as mt5
 from dotenv import load_dotenv
 
 # --- LADATAAN YMPÄRISTÖMUUTTUJAT .ENV TIEDOSTOSTA ---
-load_dotenv()
+script_dir = os.path.dirname(os.path.abspath(__file__))
+env_path = os.path.join(script_dir, '.env')
+load_dotenv(env_path)
 
-# Haetaan tunnukset tismalleen sinun .env-tiedostosi avaimilla
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 raw_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
-# SIISTIMINEN: Poistetaan heittomerkit (') ja mahdolliset lainausmerkit tai välilyönnit kooditasolla
 TELEGRAM_CHAT_ID = raw_chat_id.strip("'\" ") if raw_chat_id else None
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    print("❌ VIRHE: TELEGRAM_BOT_TOKEN tai TELEGRAM_CHAT_ID puuttuu .env-tiedostosta!")
+    print("❌ VIRHE: Ympäristömuuttujien lataus epäonnistui.")
     exit(1)
+
+# --- CONFIGURAATIO: HÄLYTYKSEN AIKAKATKAISU ---
+# Kuinka monta sekuntia parin täytyy "vaieta" ensimmäisen hälytyksen jälkeen (900s = 15min)
+# Koska kyseessä on H1-tasot, 15-30 minuuttia on optimaalinen, ettei Telegram tukkeudu.
+ALERT_COOLDOWN_SECONDS = 900 
 
 LEVELS = {
     "EURUSD": {"symbol": "EURUSD", "buy_above": 1.15906, "sell_below": 1.15900},
@@ -35,7 +39,8 @@ LEVELS = {
     "BTC":    {"symbol": "BTCUSD", "buy_above": 64172.10, "sell_below": 60713.41}
 }
 
-alert_history = {key: {"buy_triggered": False, "sell_triggered": False} for key in LEVELS}
+# Tallennetaan UNIX-aikaleima siitä, milloin hälytys on viimeksi lähetetty (0 = ei koskaan)
+alert_history = {key: {"buy_last_sent": 0.0, "sell_last_sent": 0.0} for key in LEVELS}
 
 def send_telegram_alert(display_name, order_type, price, target_level):
     emoji = "🟢" if "OSTO" in order_type else "🔴"
@@ -56,11 +61,7 @@ def send_telegram_alert(display_name, order_type, price, target_level):
     )
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     
     try:
         response = requests.post(url, json=payload)
@@ -76,10 +77,12 @@ def main():
         print("MT5 alustus epäonnistui.")
         return
     
-    print("Mr. Walker ML Alerter aktivoitu live-Telegram -syötteellä (Kooditason .env-fiksi käytössä).")
+    print("Mr. Walker ML Alerter aktivoitu. Kohinasuodatin (Cooldown) päällä.")
     
     try:
         while True:
+            current_time = time.time()
+            
             for name, config in LEVELS.items():
                 mt5_symbol = config["symbol"]
                 tick = mt5.symbol_info_tick(mt5_symbol)
@@ -88,21 +91,19 @@ def main():
                 
                 current_price = tick.last if tick.last != 0 else tick.bid
                 
-                # OSTO
+                # --- OSTO (Buy Above) ---
                 if current_price > config["buy_above"]:
-                    if not alert_history[name]["buy_triggered"]:
+                    # Tarkistetaan onko edellisestä hälytyksestä kulunut riittävästi aikaa
+                    if current_time - alert_history[name]["buy_last_sent"] > ALERT_COOLDOWN_SECONDS:
                         send_telegram_alert(name, "OSTO (Buy Above)", current_price, config["buy_above"])
-                        alert_history[name]["buy_triggered"] = True
-                else:
-                    alert_history[name]["buy_triggered"] = False
+                        alert_history[name]["buy_last_sent"] = current_time
                 
-                # MYYNTI
+                # --- MYYNTI (Sell Below) ---
                 if current_price < config["sell_below"]:
-                    if not alert_history[name]["sell_triggered"]:
+                    # Tarkistetaan onko edellisestä hälytyksestä kulunut riittävästi aikaa
+                    if current_time - alert_history[name]["sell_last_sent"] > ALERT_COOLDOWN_SECONDS:
                         send_telegram_alert(name, "MYYNTI (Sell Below)", current_price, config["sell_below"])
-                        alert_history[name]["sell_triggered"] = True
-                else:
-                    alert_history[name]["sell_triggered"] = False
+                        alert_history[name]["sell_last_sent"] = current_time
             
             time.sleep(0.5)
             
