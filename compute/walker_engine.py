@@ -6,34 +6,38 @@ import requests
 import jax
 import jax.numpy as jnp
 from jax import jit, vmap
+from functools import partial
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
 
-# --- ALUSTUS JA CONFIG ---
+# --- LADATAAN YMPÄRISTÖMUUTTUJAT .ENV TIEDOSTOSTA ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID").strip("'\" ")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+if TELEGRAM_CHAT_ID:
+    TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID.strip("'\" ")
 
 SYMBOLS = ["EURUSD", "GBPUSD", "AUDUSD", "USDCAD", "EURAUD", "GBPJPY", "XAUUSD", "BTCUSD"]
 FINNISH_TZ = pytz.timezone("Europe/Helsinki")
 
----
 
-## 1. GEOMETRINEN JAX-YDIN (Kuvatunnistus ilman luuppeja)
+# ============================================================================
+# 1. GEOMETRINEN JAX-YDIN (Kuvatunnistus ilman luuppeja)
+# ============================================================================
 
-@jit
+# FIKSI: Kerrotaan JAXille että is_uptrend_break on staattinen argumentti
+@partial(jit, static_argnames=['is_uptrend_break'])
 def detect_lightning_bolt(highs, lows, closes, level, is_uptrend_break=True):
     """
     Tunnistaa kuvien mukaisen '3+ Candle LB' / BOS rakenteen matriisista.
     Käyttää puhdasta JAX-matematiikkaa signaalin havaitsemiseen.
     """
     if is_uptrend_break:
-        # Kuvien 1 & 3 mukainen Downtrend Reverse / Bullish LB:
+        # Downtrend Reverse / Bullish LB:
         # 1. Breakout-vaihe: Viimeisimmät kynttilät sulkevat H1-vastustason (level) yläpuolelle
         break_condition = closes[-1] > level
         
         # 2. Retest-vaihe: Kynttilöiden alimmat pisteet (lows) käyvät lähellä tasoa, mutta eivät romuta sitä
-        # Etsitään alin piste breakoutin jälkeen
         retest_zone_ok = (lows[-2] <= level * 1.0005) & (lows[-2] >= level * 0.9995)
         
         # 3. Continuation-vaihe: Hinta tekee uuden huipun (HH) breakout-kynttilän yli
@@ -42,7 +46,7 @@ def detect_lightning_bolt(highs, lows, closes, level, is_uptrend_break=True):
         signal = break_condition & retest_zone_ok & continuation_ok
         return jnp.where(signal, 1.0, 0.0)
     else:
-        # Kuvan 2 mukainen Uptrend Reverse / Bearish LB (Break Below):
+        # Uptrend Reverse / Bearish LB (Break Below):
         break_condition = closes[-1] < level
         retest_zone_ok = (highs[-2] >= level * 0.9995) & (highs[-2] <= level * 1.0005)
         continuation_ok = closes[-1] < lows[-2]
@@ -50,9 +54,10 @@ def detect_lightning_bolt(highs, lows, closes, level, is_uptrend_break=True):
         signal = break_condition & retest_zone_ok & continuation_ok
         return jnp.where(signal, 1.0, 0.0)
 
----
 
-## 2. RAKENTEELLISET TASOT (Aamun klo 09:00 rutiini)
+# ============================================================================
+# 2. RAKENTEELLISET TASOT (Aamun klo 09:00 rutiini)
+# ============================================================================
 
 def get_daily_h1_boundaries():
     """
@@ -65,6 +70,7 @@ def get_daily_h1_boundaries():
         # Haetaan edellisen 24 tunnin konsolidaatio (Chop zone)
         rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, 24)
         if rates is None or len(rates) == 0:
+            print(f"⚠️ Varoitus: H1-dataa ei saatu symbolille {symbol}")
             continue
             
         highs = [c['high'] for c in rates]
@@ -77,9 +83,10 @@ def get_daily_h1_boundaries():
         print(f"📊 {symbol: <7} Locked -> Range: {min(lows):.5f} - {max(highs):.5f}")
     return daily_levels
 
----
 
-## 3. LÄHETYS JA SEURANTA (The Execution Layer)
+# ============================================================================
+# 3. LÄHETYS JA SEURANTA (The Execution Layer)
+# ============================================================================
 
 def send_premium_lightning_bolt_alert(symbol, direction, price):
     """
@@ -101,11 +108,15 @@ def send_premium_lightning_bolt_alert(symbol, direction, price):
         f"👉 *Action:* Check lot size and execute according to 1:2 / 1:4 trailing rules."
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
+    except Exception as e:
+        print(f"❌ Virhe Telegram-hälytyksen lähetyksessä: {e}")
 
----
 
-## 4. PÄÄOHJELMA JA AJASTINLOOPPI
+# ============================================================================
+# 4. PÄÄOHJELMA JA AJASTINLOOPPI
+# ============================================================================
 
 def main():
     if not mt5.initialize():
@@ -145,21 +156,21 @@ def main():
                 if not limits:
                     continue
                 
-                # --- CASE 1: Hinta on ylittänyt H1 OSTO-rajan -> Etsitään Bullish LB (Kuva 1 & 3) ---
+                # --- CASE 1: Hinta on ylittänyt H1 OSTO-rajan -> Etsitään Bullish LB ---
                 if current_price > limits["buy_above"]:
                     signal = detect_lightning_bolt(m15_highs, m15_lows, m15_closes, limits["buy_above"], is_uptrend_break=True)
                     if signal == 1.0:
                         send_premium_lightning_bolt_alert(symbol, "BULLISH BREAKOUT", current_price)
-                        time.sleep(60) # Cooldown ettei lähetetä saman kynttilän aikana uudestaan
+                        time.sleep(60) # Estetään spämmäys saman kynttilän aikana
                 
-                # --- CASE 2: Hinta on alittanut H1 MYYNTI-rajan -> Etsitään Bearish LB (Kuva 2) ---
+                # --- CASE 2: Hinta on alittanut H1 MYYNTI-rajan -> Etsitään Bearish LB ---
                 if current_price < limits["sell_below"]:
                     signal = detect_lightning_bolt(m15_highs, m15_lows, m15_closes, limits["sell_below"], is_uptrend_break=False)
                     if signal == 1.0:
                         send_premium_lightning_bolt_alert(symbol, "BEARISH BREAKOUT", current_price)
                         time.sleep(60)
                         
-            time.sleep(1.0) # Skannataan markkinat kerran sekunnissa
+            time.sleep(1.0) # Skannataan kerran sekunnissa
             
     except KeyboardInterrupt:
         print("\nAutopilot sammutettu.")
