@@ -2,44 +2,38 @@ import jax
 import jax.numpy as jnp
 
 @jax.jit
-def calculate_vacuum_burst(history_matrix):
+def calculate_triad_inertia(volume, macd_hist, friction_weight):
     """
-    Puhdas, JIT-optimoitu JAX-funktio yhdelle tai useammalle parille.
-    history_matrix muotoa: (history_len, 3) -> Sarakkeet: [kitka, volyymi, momentum]
+    Laskee puhtaan tilausvirran Inertiaindeksin.
+    Korkea inertia = Markkina on "raskas", seinää puretaan kovalla volyymilla mutta momentum ei kasva.
+    Matala inertia = Markkina on "kevyt", hinta liukuu helposti.
     """
-    # Erotetaan komponentit tensorista
-    friction = history_matrix[:, 0]
-    volume = history_matrix[:, 1]
-    momentum = history_matrix[:, 2]
+    abs_macd = jnp.abs(macd_hist) + 1e-7
+    inertia_index = (volume / abs_macd) * friction_weight
+    return inertia_index
 
-    # Lasketaan ensimmäiset ja toiset derivaatat (Kiihtyvyys ja Voima)
-    dfriction = jnp.gradient(friction)
-    dmomentum = jnp.gradient(momentum)
-    dvolume = jnp.gradient(volume)
-
-    # VOIMAKAS TYHJIÖ-ANALYYSI (The Vacuum Logic):
-    # Jos momentum on kova, volyymi kasvaa, mutta kitka (vastus) romahtaa jyrkästi alas,
-    # kyseessä on likviditeettiseinän murtuminen -> hinta slipaa tyhjiöön.
+@jax.jit
+def calculate_synthetic_dom(tick_delta, tick_volume, price_change_pips):
+    """
+    Kvantitatiivinen Kyle's Lambda / Price Impact -malli.
+    Laskee reaaliaikaisen synteettisen tilauskirjan epätasapainon (Synthetic DOM).
     
-    current_friction = friction[-1]
-    current_momentum = momentum[-1]
+    Palauttaa:
+    - synthetic_imbalance: -1.0 (Näkymätön myyntimuuri) ... +1.0 (Näkymätön ostoseinä)
+    - liquidity_stiffness: Mitä suurempi luku, sitä paksumpi piiloseinä on imemässä voimaa.
+    """
+    # Estetään nollalla jakaminen dynaamisella epsilonilla
+    abs_price_move = jnp.abs(price_change_pips) + 1e-4
     
-    # Kitkan muutosnopeus (jos negatiivinen, seinä sulaa alta)
-    friction_velocity = dfriction[-1]
+    # Markkinan kireys (Stiffness): Kuinka paljon volyymia transaktoitiin per liikutettu pipsi
+    liquidity_stiffness = tick_volume / abs_price_move
     
-    # Momentumin kiihtyvyys
-    momentum_acceleration = jnp.gradient(dmomentum)[-1]
-
-    # Lasketaan indikaattori tyhjiölle (VBI - Vacuum Burst Index)
-    # Suuri arvo tarkoittaa, että jarrut on vapautettu ja momentum vetää takaa
-    vbi = (jnp.abs(current_momentum) * dvolume[-1]) / (jnp.abs(current_friction) + 0.1)
+    # Lasketaan raaka dynaaminen paine
+    raw_pressure = tick_delta / (tick_volume + 1e-7)
     
-    # Signaalilogiikka: Pitääkö iskeä sisään?
-    # Aktivoituu, kun kitka ohenee vauhdilla (friction_velocity < -0.5) ja momentum vahvistuu
-    trigger_short = (current_momentum < 0) & (friction_velocity < -0.2) & (vbi > 1.5)
-    trigger_long = (current_momentum > 0) & (friction_velocity < -0.2) & (vbi > 1.5)
-
-    direction = jnp.where(trigger_long, 1.0, jnp.where(trigger_short, -1.0, 0.0))
-    confidence = jnp.clip(vbi * 10.0, 0.0, 100.0)
-
-    return direction, confidence, vbi
+    # Jos kireys (stiffness) on valtava (eli volyymi hakkaa tyhjää ilman hinnanmuutosta), 
+    # se vahvistaa piilossa olevan absorptioseinän läsnäolon.
+    stiffness_factor = jnp.clip(jnp.log1p(liquidity_stiffness) / 8.0, 0.1, 2.0)
+    synthetic_imbalance = jnp.clip(raw_pressure * stiffness_factor, -1.0, 1.0)
+    
+    return synthetic_imbalance, liquidity_stiffness

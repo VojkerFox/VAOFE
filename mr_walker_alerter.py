@@ -22,21 +22,22 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 # Koska kyseessä on H1-tasot, 15-30 minuuttia on optimaalinen, ettei Telegram tukkeudu.
 ALERT_COOLDOWN_SECONDS = 900 
 
+# --- VKO 24 H1 TASOT (14.6.2026) ---
 LEVELS = {
-    "EURUSD": {"symbol": "EURUSD", "buy_above": 1.15906, "sell_below": 1.15900},
-    "GBPUSD": {"symbol": "GBPUSD", "buy_above": 1.34175, "sell_below": 1.33230},
-    "AUDUSD": {"symbol": "AUDUSD", "buy_above": 0.70555, "sell_below": 0.69780},
-    "USDCAD": {"symbol": "USDCAD", "buy_above": 1.40250, "sell_below": 1.39290},
-    "EURAUD": {"symbol": "EURAUD", "buy_above": 1.64580, "sell_below": 1.64050},
-    "GBPCHF": {"symbol": "GBPCHF", "buy_above": 1.07010, "sell_below": 1.06455},
-    "GBPJPY": {"symbol": "GBPJPY", "buy_above": 214.990, "sell_below": 213.830},
-    "GBPAUD": {"symbol": "GBPAUD", "buy_above": 1.91220, "sell_below": 1.90050},
-    "GBPCAD": {"symbol": "GBPCAD", "buy_above": 1.87500, "sell_below": 1.86505},
-    "EURCAD": {"symbol": "EURCAD", "buy_above": 1.61775, "sell_below": 1.61025},
-    "AUDJPY": {"symbol": "AUDJPY", "buy_above": 113.188, "sell_below": 112.020},
-    "KULTA":  {"symbol": "XAUUSD", "buy_above": 4247.08, "sell_below": 4023.80}, 
-    "XRPUSD": {"symbol": "XRPUSD", "buy_above": 1.1480,  "sell_below": 1.0865},
-    "BTC":    {"symbol": "BTCUSD", "buy_above": 64172.10, "sell_below": 60713.41}
+    "EURUSD": {"symbol": "EURUSD", "buy_above": 1.15905, "sell_below": 1.15020},
+    "GBPUSD": {"symbol": "GBPUSD", "buy_above": 1.34350, "sell_below": 1.33240},
+    "AUDUSD": {"symbol": "AUDUSD", "buy_above": 0.70790, "sell_below": 0.69780},
+    "USDCAD": {"symbol": "USDCAD", "buy_above": 1.40245, "sell_below": 1.39525},
+    "EURAUD": {"symbol": "EURAUD", "buy_above": 1.64680, "sell_below": 1.64070},
+    "GBPCHF": {"symbol": "GBPCHF", "buy_above": 1.07010, "sell_below": 1.06560},
+    "GBPJPY": {"symbol": "GBPJPY", "buy_above": 215.255, "sell_below": 213.860},
+    "GBPAUD": {"symbol": "GBPAUD", "buy_above": 1.91250, "sell_below": 1.90095},
+    "GBPCAD": {"symbol": "GBPCAD", "buy_above": 1.87700, "sell_below": 1.87110},
+    "EURCAD": {"symbol": "EURCAD", "buy_above": 1.62010, "sell_below": 1.61615},
+    "AUDJPY": {"symbol": "AUDJPY", "buy_above": 113.205, "sell_below": 112.020},
+    "KULTA":  {"symbol": "XAUUSD", "buy_above": 4271.63, "sell_below": 4021.53}, 
+    "XRPUSD": {"symbol": "XRPUSD", "buy_above": 1.1855,  "sell_below": 1.1255},
+    "BTC":    {"symbol": "BTCUSD", "buy_above": 64750.0, "sell_below": 62248.0}
 }
 
 # Tallennetaan UNIX-aikaleima siitä, milloin hälytys on viimeksi lähetetty (0 = ei koskaan)
@@ -77,7 +78,7 @@ def main():
         print("MT5 alustus epäonnistui.")
         return
     
-    print("Mr. Walker ML Alerter aktivoitu. Kohinasuodatin (Cooldown) päällä.")
+    print("Mr. Walker ML Alerter aktivoitu. Kohinasuodatin (Cooldown) päällä. VKO 24 Tasot ladattu.")
     
     try:
         while True:

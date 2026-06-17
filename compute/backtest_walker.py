@@ -2,97 +2,100 @@ import os
 import sys
 import MetaTrader5 as mt5
 import jax.numpy as jnp
+from jax import jit, vmap, lax
 from datetime import datetime, timedelta
 
-# Lisätään polku juureen, jotta importit walker_enginesta toimivat
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(script_dir)
-from walker_engine import detect_lightning_bolt, SYMBOLS
+from walker_engine import SYMBOLS
 
-def run_multi_asset_backtest(days_to_test=7):
-    """
-    Simuloi kaikkien 14 instrumentin live-toimintaa menneisyydessä.
-    Laskee jokaiselle päivälle aidot H1-rajat ja skannaa M15 salamat JAXilla.
-    """
-    if not mt5.initialize():
-        print("❌ MT5 alustus epäonnistui. Varmista, että ohjelma on auki taustalla.")
-        return
+# --- JAX-YDIN ---
+STATE_IDLE = 0
+STATE_ACTION = 1
 
-    print(f"\n🦅 VOJKER AUTOMATED BACKTESTER – MULTI-ASSET TRACKING 🦅")
-    print(f"🔄 Analysoidaan {days_to_test} edellistä markkinapäivää dynaamisilla H1-tasoilla...")
-    print("=" * 105)
-    print(f"{'AJANKOHTA':<17} | {'PARI':<10} | {'SUUNTA':<16} | {'HINTA':<10} | {'RIKKOTTU TASO':<14} | {'STATUS'}")
-    print("=" * 105)
-
-    total_signals = 0
-    all_events = []
-    now = datetime.now()
+@jit
+def rdaas_fsm_step(carry, xs):
+    # Puretaan 8 muuttujaa: (high, low, close, h1_res, h1_sup, h1_bull, h1_bear, is_trade)
+    state, entry, sl, be_hit, max_box, cooldown, direction = carry
+    high, low, close, h1_res, h1_sup, h1_bull, h1_bear, is_trade = xs
     
-    # Käydään päivät läpi järjestyksessä menneisyydestä tähän päivään
-    for d in range(days_to_test, -1, -1):
-        # Määritellään testattavan päivän aloitushetki (klo 09:00 vastaava hetki menneisyydessä)
-        test_day_start = datetime(now.year, now.month, now.day) - timedelta(days=d)
-        test_day_end = test_day_start + timedelta(days=1)
+    cooldown = jnp.maximum(0, cooldown - 1)
+    
+    can_trade = (state == STATE_IDLE) & (cooldown == 0) & is_trade
+    trigger_long = can_trade & h1_bull & (close > h1_res)
+    trigger_short = can_trade & h1_bear & (close < h1_sup)
+
+    state = jnp.where(trigger_long | trigger_short, STATE_ACTION, state)
+    entry = jnp.where(trigger_long | trigger_short, close, entry)
+    direction = jnp.where(trigger_long, 1.0, jnp.where(trigger_short, -1.0, direction))
+    
+    risk = jnp.maximum(jnp.abs(entry - jnp.where(trigger_long, h1_res, h1_sup)), close * 0.0015)
+    sl = jnp.where(trigger_long, entry - risk, jnp.where(trigger_short, entry + risk, sl))
+    max_box = jnp.where(trigger_long | trigger_short, 0.0, max_box)
+    be_hit = jnp.where(trigger_long | trigger_short, 0.0, be_hit)
+
+    is_active = (state == STATE_ACTION)
+    profit = jnp.where(direction == 1.0, high - entry, entry - low)
+    max_box = jnp.where(is_active, jnp.maximum(max_box, jnp.floor(profit / risk)), max_box)
+    be_hit = jnp.where(is_active & (max_box >= 0.2), 1.0, be_hit)
+    
+    hit_sl = is_active & jnp.where(direction == 1.0, low <= jnp.where(be_hit, entry, sl), high >= jnp.where(be_hit, entry, sl))
+    # Yksinkertaistettu palkkio
+    payout = jnp.where(max_box < 1.0, -1.0, jnp.where(max_box == 1.0, 0.0, max_box - 1.0))
+    
+    state = jnp.where(hit_sl, STATE_IDLE, state)
+    cooldown = jnp.where(hit_sl, 24, cooldown)
+    return (state, entry, sl, be_hit, max_box, cooldown, direction), (hit_sl, payout, direction, entry, max_box)
+
+vmap_rdaas = vmap(lambda c, x: lax.scan(rdaas_fsm_step, c, x))
+
+def run_ytd_audit():
+    if not mt5.initialize(): return
+    curr, end = datetime(2026, 1, 1), datetime.now()
+    total_r = 0.0
+    
+    while curr < end:
+        nxt = (curr.replace(day=28) + timedelta(days=4)).replace(day=1)
+        if nxt > end: nxt = end
         
-        for symbol in SYMBOLS:
-            # 1. Haetaan H1-tasot testipäivää edeltäneeltä 24 tunnilta (Aamun klo 09:00 rutiini)
-            h1_rates = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_H1, test_day_start, 24)
-            if h1_rates is None or len(h1_rates) == 0:
-                continue
+        master = mt5.copy_rates_range("EURUSD", mt5.TIMEFRAME_M15, curr, nxt)
+        if master is None or len(master) == 0: curr = nxt; continue
+        m_times = [int(c['time']) for c in master]
+        
+        h_all, l_all, c_all, res_all, sup_all, bull_all, bear_all, win_all = [], [], [], [], [], [], [], []
+
+        for sym in SYMBOLS:
+            rates = mt5.copy_rates_range(sym, mt5.TIMEFRAME_M15, curr, nxt)
+            data = {int(c['time']): c for c in rates} if rates is not None else {}
+            h, l, c = [], [], []
+            last = rates[0] if rates is not None and len(rates) > 0 else {'high':0,'low':0,'close':0}
+            for t in m_times:
+                b = data.get(t, last)
+                h.append(float(b['high'])); l.append(float(b['low'])); c.append(float(b['close']))
+                last = b
+            h_j, l_j, c_j = jnp.array(h), jnp.array(l), jnp.array(c)
+            # Staattinen ikkuna JAX-yhteensopivuuden varmistamiseksi
+            final_max, final_min = lax.fori_loop(96, len(c_j), lambda i, carry: (
+                carry[0].at[i].set(jnp.max(lax.dynamic_slice(h_j, (i-96,), (96,)))),
+                carry[1].at[i].set(jnp.min(lax.dynamic_slice(l_j, (i-96,), (96,))))
+            ), (jnp.zeros_like(h_j), jnp.zeros_like(l_j)))
             
-            h1_highs = [c['high'] for c in h1_rates]
-            h1_lows = [c['low'] for c in h1_rates]
-            buy_above_level = float(max(h1_highs))
-            sell_below_level = float(min(h1_lows))
+            h_all.append(h_j); l_all.append(l_j); c_all.append(c_j)
+            res_all.append(final_max); sup_all.append(final_min)
+            bull_all.append(c_j > final_max); bear_all.append(c_j < final_min)
+            win_all.append(jnp.array([9 <= datetime.fromtimestamp(t).hour < 22 for t in m_times]))
 
-            # 2. Haetaan saman vuorokauden M15 kynttilät live-seurantaa varten
-            m15_rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M15, test_day_start, test_day_end)
-            if m15_rates is None or len(m15_rates) < 10:
-                continue
-
-            # 3. Liukuva ikkuna kynttilöiden yli (tismalleen kuten walker_engine.py:ssä)
-            for i in range(10, len(m15_rates)):
-                window = m15_rates[i-10:i]
-                
-                m15_highs = jnp.array([c['high'] for c in window])
-                m15_lows = jnp.array([c['low'] for c in window])
-                m15_closes = jnp.array([c['close'] for c in window])
-                
-                current_price = float(m15_closes[-1])
-                event_time = datetime.fromtimestamp(int(window[-1]['time']))
-                time_str = event_time.strftime('%Y-%m-%d %H:%M')
-
-                # --- CASE A: OSTO-Murtuma (Bullish) ---
-                if current_price > buy_above_level:
-                    signal = detect_lightning_bolt(m15_highs, m15_lows, m15_closes, buy_above_level, is_uptrend_break=True)
-                    if signal == 1.0:
-                        all_events.append({
-                            'time_raw': event_time,
-                            'output': f"{time_str:<17} | {symbol:<10} | {'BULLISH BREAK':<16} | {current_price:<10.5f} | {buy_above_level:<14.5f} | ⚡ VALID LB"
-                        })
-                        total_signals += 1
-
-                # --- CASE B: MYYNTI-Murtuma (Bearish) ---
-                elif current_price < sell_below_level:
-                    signal = detect_lightning_bolt(m15_highs, m15_lows, m15_closes, sell_below_level, is_uptrend_break=False)
-                    if signal == 1.0:
-                        all_events.append({
-                            'time_raw': event_time,
-                            'output': f"{time_str:<17} | {symbol:<10} | {'BEARISH BREAK':<16} | {current_price:<10.5f} | {sell_below_level:<14.5f} | ⚡ VALID LB"
-                        })
-                        total_signals += 1
-
-    # Järjestetään kaikki havaitut tapahtumat globaaliin aikajärjestykseen yli kaikkien parien
-    all_events.sort(key=lambda x: x['time_raw'])
-    for event in all_events:
-        print(event['output'])
-
-    print("=" * 105)
-    print(f"✨ MULTI-ASSET BACKTEST VALMIS. Löydetty yhteensä {total_signals} mekaanisesti vahvistettua rakennetta.")
-    print("=" * 105 + "\n")
-    
+        _, (sigs, profs, _, _, _) = vmap_rdaas(
+            (jnp.zeros(len(SYMBOLS), int), jnp.zeros(len(SYMBOLS)), jnp.zeros(len(SYMBOLS)), jnp.zeros(len(SYMBOLS)), jnp.zeros(len(SYMBOLS)), jnp.zeros(len(SYMBOLS), int), jnp.zeros(len(SYMBOLS))),
+            (jnp.stack(h_all), jnp.stack(l_all), jnp.stack(c_all), jnp.stack(res_all), jnp.stack(sup_all), jnp.stack(bull_all), jnp.stack(bear_all), jnp.stack(win_all))
+        )
+        
+        for t in range(len(m_times)):
+            for s in range(len(SYMBOLS)):
+                if sigs[s, t]: total_r += float(profs[s, t])
+        curr = nxt
+        
+    print(f"\n✅ YTD 2026 NETTOTUOTTO (0.2R BE): {total_r:+.2f} R")
     mt5.shutdown()
 
-if __name__ == "__main__":
-    # Testataan oletuksena viimeistä 7 markkinapäivää dynaamisesti
-    run_multi_asset_backtest(days_to_test=7)
+if __name__ == "__main__": run_ytd_audit()
