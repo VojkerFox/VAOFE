@@ -9,12 +9,22 @@ from datetime import datetime
 from typing import Tuple, Dict, Any
 import json
 
-# Lisätään compute-kansio polkuun, jotta chart_maker löytyy
+# Lisätään compute-kansio polkuun, jotta omat moduulit löytyvät
 sys.path.append(os.path.join(os.path.dirname(__file__), 'compute'))
+
+# Yritetään tuoda graafikone (Jos puuttuu, tehdään tyhjä funktio jottei ohjelma kaadu)
 try:
     from chart_maker import generate_setup_chart
-except ImportError:
-    print("⚠️ Ei voitu tuoda chart_makeria. Varmista että compute/chart_maker.py on olemassa.")
+except ImportError as e:
+    print(f"⚠️ Ei voitu tuoda chart_makeria: {e}")
+    def generate_setup_chart(*args, **kwargs): pass
+
+# Yritetään tuoda tietokantaseuranta (Jos puuttuu, tehdään tyhjä funktio jottei ohjelma kaadu)
+try:
+    from sniffer_tracker import log_trade_signal
+except ImportError as e:
+    print(f"⚠️ Ei voitu tuoda sniffer_trackeria: {e}")
+    def log_trade_signal(*args, **kwargs): pass
 
 # ==========================================
 # 1. KONFIGURAATIO JA ASETUKSET
@@ -154,7 +164,7 @@ def run_sniffer3() -> None:
         return
         
     logger.info("🦅 SNIFFER 3: VISUAL SNIPER KÄYNNISTETTY 🦅")
-    send_telegram_alert("🦅 <b>Sniffer 3: VISUAL SNIPER KÄYNNISTETTY</b> 🦅\nUI-Päivitys: Graafit, Inline-painikkeet ja Reply-ketjutus aktivoitu!")
+    send_telegram_alert("🦅 <b>Sniffer 3: VISUAL SNIPER KÄYNNISTETTY</b> 🦅\nUI-Päivitys: Graafit, Tracker ja Reply-ketjutus aktivoitu!")
     
     try:
         while True:
@@ -236,7 +246,6 @@ def run_sniffer3() -> None:
                                 if live_price < radar_states[state_key]['pivot']:
                                     radar_states[state_key]['pivot'] = live_price
                                 if live_price >= radar_states[state_key]['pivot'] + bounce_req:
-                                    # UUTTA: Generoidaan kuva juuri ennen lähetystä!
                                     chart_path = f"setup_{symbol}.png"
                                     try:
                                         # Otetaan 60 viimeistä kynttilää graafiin
@@ -251,7 +260,13 @@ def run_sniffer3() -> None:
                                            f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
                                            f"<b>Tuki (SL):</b> <code>{target_level:.5f}</code>")
                                     
+                                    # LÄHETETÄÄN VIESTI JA TALLENNETAAN KANTAAN
                                     send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
+                                    try:
+                                        log_trade_signal(symbol, tf_name, "BULL", live_price, target_level)
+                                    except Exception as e:
+                                        logger.error(f"Tietokantatallennus epäonnistui: {e}")
+                                        
                                     radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
 
                         elif direction == 'BEAR':
@@ -264,7 +279,6 @@ def run_sniffer3() -> None:
                                 if live_price > radar_states[state_key]['pivot']:
                                     radar_states[state_key]['pivot'] = live_price
                                 if live_price <= radar_states[state_key]['pivot'] - bounce_req:
-                                    # UUTTA: Generoidaan kuva juuri ennen lähetystä!
                                     chart_path = f"setup_{symbol}.png"
                                     try:
                                         generate_setup_chart(symbol, rates[-60:], target_level, radar_states[state_key]['pivot'], direction, chart_path)
@@ -278,7 +292,13 @@ def run_sniffer3() -> None:
                                            f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
                                            f"<b>Vastus (SL):</b> <code>{target_level:.5f}</code>")
                                            
+                                    # LÄHETETÄÄN VIESTI JA TALLENNETAAN KANTAAN
                                     send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
+                                    try:
+                                        log_trade_signal(symbol, tf_name, "BEAR", live_price, target_level)
+                                    except Exception as e:
+                                        logger.error(f"Tietokantatallennus epäonnistui: {e}")
+                                        
                                     radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
 
             time.sleep(SCAN_INTERVAL_SEC)
