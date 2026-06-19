@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import requests
 import logging
@@ -6,6 +7,14 @@ import MetaTrader5 as mt5
 import jax.numpy as jnp
 from datetime import datetime
 from typing import Tuple, Dict, Any
+import json
+
+# Lisätään compute-kansio polkuun, jotta chart_maker löytyy
+sys.path.append(os.path.join(os.path.dirname(__file__), 'compute'))
+try:
+    from chart_maker import generate_setup_chart
+except ImportError:
+    print("⚠️ Ei voitu tuoda chart_makeria. Varmista että compute/chart_maker.py on olemassa.")
 
 # ==========================================
 # 1. KONFIGURAATIO JA ASETUKSET
@@ -21,242 +30,263 @@ TIMEFRAMES = {
     "M30": mt5.TIMEFRAME_M30
 }
 
-# --- Algoritmin Hienosäätö ---
-SWING_STRENGTH = 10         # Kuinka monta kynttilää vaaditaan Macro-pohjan/-huipun vahvistukseen
-RETEST_ZONE_PIPS = 3.5      # Kuinka lähelle tasoa hinnan pitää tulla (Pips)
-FAKE_OUT_PIPS = 2.0         # Kuinka kauas tason "väärälle" puolelle hinta saa mennä ennen peruutusta
-MAX_WAIT_CANDLES = 24       # Kuinka monta kynttilää odotetaan retestiä, ennen kuin set-up perutaan
-SCAN_INTERVAL_SEC = 5       # Tutkan päivitysväli (sekuntia)
+SWING_STRENGTH = 10
+RETEST_APPROACH_PIPS = 8.0
+BOUNCE_CONFIRM_PIPS = 3.5
+FAKE_OUT_PIPS = 8.0
+MAX_WAIT_CANDLES = 24
+SCAN_INTERVAL_SEC = 3
 
 # ==========================================
-# 2. LOGGING-JÄRJESTELMÄN ALUSTUS
+# 2. LOGGING & TELEGRAM KUVANLÄHETYS
 # ==========================================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    datefmt='%H:%M:%S'
-)
-logger = logging.getLogger("TwoStageRadar")
-
-# Vaimennetaan JAX:n harmiton TPU-varoitus (estetään terminaalin spämmi)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', datefmt='%H:%M:%S')
+logger = logging.getLogger("Sniffer3")
 logging.getLogger("jax._src.xla_bridge").setLevel(logging.ERROR)
 
-# Globaalit tilamuuttujat
 radar_states: Dict[str, Dict[str, Any]] = {}
-last_alerted_candle: Dict[str, int] = {}
+
+def send_telegram_alert(message: str, reply_to_msg_id: int = None, photo_path: str = None, symbol: str = None) -> int:
+    """
+    Lähettää joko pelkän tekstin (Vaihe 1) TAI kuvan + painikkeet (Vaihe 2).
+    """
+    # Jos on kuva, käytetään sendPhoto-endpointia
+    if photo_path and os.path.exists(photo_path):
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        
+        # Luodaan Action-painikkeet
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": f"🟢 Avaa MT5 ({symbol})", "url": f"tg://resolve?domain=mt5"} 
+                ],
+                [
+                    {"text": "📊 Avaa VAOFE Dashboard", "url": "http://localhost:8501"}
+                ]
+            ]
+        }
+        
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "caption": message,
+            "parse_mode": "HTML",
+            "reply_markup": json.dumps(keyboard)
+        }
+        
+        if reply_to_msg_id:
+            data["reply_to_message_id"] = reply_to_msg_id
+            
+        with open(photo_path, 'rb') as photo:
+            files = {"photo": photo}
+            try:
+                response = requests.post(url, data=data, files=files, timeout=10)
+                res_data = response.json()
+                if res_data.get("ok"):
+                    return res_data["result"]["message_id"]
+            except Exception as e:
+                logger.error(f"Telegram kuvanlähetysvirhe: {e}")
+                
+    # Jos EI ole kuvaa (Vaihe 1), käytetään tavallista sendMessage-endpointia
+    else:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        if reply_to_msg_id:
+            payload["reply_to_message_id"] = reply_to_msg_id
+            
+        try:
+            response = requests.post(url, json=payload, timeout=5)
+            res_data = response.json()
+            if res_data.get("ok"):
+                return res_data["result"]["message_id"]
+        except Exception as e:
+            logger.error(f"Telegram tekstivirhe: {e}")
+            
+    return 0
+
+def get_pip_size(pair: str) -> float:
+    if "JPY" in pair: return 0.01
+    if "GOLD" in pair or "XAU" in pair: return 0.1
+    if "BTC" in pair: return 1.0
+    if "US30" in pair or "SPX" in pair: return 1.0
+    return 0.0001
 
 # ==========================================
-# 3. TELEGRAM-YHTEYS
+# 3. JAX RAKENNETUNNISTUS 
 # ==========================================
-def send_telegram_alert(message: str) -> None:
-    """Lähettää asynkronisesti viestin Telegramiin ja nappaa mahdolliset yhteysvirheet."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        response = requests.post(url, json=payload, timeout=5)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Telegram-virhe: Ei voitu lähettää viestiä. Syy: {e}")
-
-# ==========================================
-# 4. JAX RAKENNETUNNISTUS (MACRO BOS)
-# ==========================================
-def detect_bos_structure(highs: jnp.ndarray, lows: jnp.ndarray, closes: jnp.ndarray, strength: int = 10) -> Tuple[bool, bool, float, float]:
-    """
-    Etsii Macro-tason markkinarakenteen (Swing High/Low) ja palauttaa BOS-murtumat.
-    """
+def detect_bos_structure(highs: jnp.ndarray, lows: jnp.ndarray, closes: jnp.ndarray, times: list, strength: int = 10):
     hist_h = highs[:-1]
     hist_l = lows[:-1]
-    hist_c = closes[:-1]
-    
-    recent_swing_high = float('inf')
-    recent_swing_low = 0.0
+    recent_swing_high, recent_swing_low = float('inf'), 0.0
     found_h, found_l = False, False
-    
     start_idx = len(hist_h) - strength - 1
     if start_idx >= strength:
         for i in range(start_idx, strength - 1, -1):
             window_h = hist_h[i - strength : i + strength + 1]
             window_l = hist_l[i - strength : i + strength + 1]
-            
             if not found_h and hist_h[i] == jnp.max(window_h):
                 recent_swing_high = float(hist_h[i])
                 found_h = True
             if not found_l and hist_l[i] == jnp.min(window_l):
                 recent_swing_low = float(hist_l[i])
                 found_l = True
-            if found_h and found_l:
-                break
-                
+            if found_h and found_l: break
     if not found_h: recent_swing_high = float(jnp.max(hist_h))
     if not found_l: recent_swing_low = float(jnp.min(hist_l))
-    
-    prev_close = hist_c[-2]
-    curr_close = hist_c[-1]
-    
-    bull_bos = (prev_close <= recent_swing_high) and (curr_close > recent_swing_high)
-    bear_bos = (prev_close >= recent_swing_low) and (curr_close < recent_swing_low)
-    
-    return bool(bull_bos), bool(bear_bos), recent_swing_high, recent_swing_low
+    bull_bos, bear_bos = False, False
+    bos_time = 0
+    for i in range(-4, -1):
+        prev_c = float(closes[i-1])
+        curr_c = float(closes[i])
+        if prev_c <= recent_swing_high and curr_c > recent_swing_high:
+            bull_bos, bear_bos = True, False
+            bos_time = times[i]
+        elif prev_c >= recent_swing_low and curr_c < recent_swing_low:
+            bear_bos, bull_bos = True, False
+            bos_time = times[i]
+    return bull_bos, bear_bos, recent_swing_high, recent_swing_low, bos_time
 
 # ==========================================
-# 5. KAKSIVAIHEINEN TUTKASILMUKKA (TWO-STAGE RADAR)
+# 4. KAKSIVAIHEINEN TUTKASILMUKKA
 # ==========================================
-def run_radar_sniffer() -> None:
+def run_sniffer3() -> None:
     if not mt5.initialize():
-        logger.error("MT5 alustus epäonnistui. Tarkista, että MetaTrader 5 on auki.")
+        logger.error("MT5 alustus epäonnistui.")
         return
         
-    logger.info("🦅 SNIFFER 2: TWO-STAGE RADAR KÄYNNISTETTY 🦅")
-    send_telegram_alert(
-        "🦅 <b>Sniffer2: TWO-STAGE RADAR KÄYNNISTETTY</b> 🦅\n"
-        "Ammattilaisversio: Parametrit optimoitu, Bounce-tarkastaja aktivoitu."
-    )
+    logger.info("🦅 SNIFFER 3: VISUAL SNIPER KÄYNNISTETTY 🦅")
+    send_telegram_alert("🦅 <b>Sniffer 3: VISUAL SNIPER KÄYNNISTETTY</b> 🦅\nUI-Päivitys: Graafit, Inline-painikkeet ja Reply-ketjutus aktivoitu!")
     
     try:
         while True:
             for symbol in SYMBOLS:
-                sym_info = mt5.symbol_info(symbol)
-                if sym_info is None:
-                    continue
-                    
-                # Dynaaminen Pips-laskenta
-                point = sym_info.point
-                pip_factor = point * 10 if sym_info.digits in [3, 5] else point
+                if mt5.symbol_info(symbol) is None: continue
+                pip_factor = get_pip_size(symbol)
                 
-                # Dynaamiset vyöhykerajat asetusmuuttujista
-                zone_buffer_in = RETEST_ZONE_PIPS * pip_factor
-                zone_buffer_out = FAKE_OUT_PIPS * pip_factor
+                if "XAU" in symbol or "GOLD" in symbol:
+                    zone_appr = 20.0 * pip_factor  
+                    bounce_req = 5.0 * pip_factor  
+                    zone_fake = 15.0 * pip_factor  
+                elif "BTC" in symbol:
+                    zone_appr = 150.0 * pip_factor
+                    bounce_req = 50.0 * pip_factor
+                    zone_fake = 100.0 * pip_factor
+                else:
+                    zone_appr = RETEST_APPROACH_PIPS * pip_factor
+                    bounce_req = BOUNCE_CONFIRM_PIPS * pip_factor
+                    zone_fake = FAKE_OUT_PIPS * pip_factor
                 
                 for tf_name, tf_value in TIMEFRAMES.items():
                     state_key = f"{symbol}_{tf_name}"
-                    
                     if state_key not in radar_states:
-                        radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'time': 0}
+                        radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': 0, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
                         
-                    # Haemme 150 kynttilää turvamarginaalilla
                     rates = mt5.copy_rates_from_pos(symbol, tf_value, 0, 150)
-                    if rates is None or len(rates) < 100: 
-                        continue
+                    if rates is None or len(rates) < 100: continue
                     
                     highs = jnp.array([r['high'] for r in rates])
                     lows = jnp.array([r['low'] for r in rates])
                     closes = jnp.array([r['close'] for r in rates])
+                    times = [int(r['time']) for r in rates]
                     
-                    completed_time = int(rates[-2]['time'])
                     live_price = float(rates[-1]['close']) 
-                    
                     current_state = radar_states[state_key]['state']
                     
-                    # ---------------------------------------------------------
-                    # VAIHE 1: IDLE-TILASSA ETSITÄÄN BOS-MURTUMAA
-                    # ---------------------------------------------------------
                     if current_state == 'IDLE':
-                        bull_bos, bear_bos, res_level, sup_level = detect_bos_structure(highs, lows, closes, strength=SWING_STRENGTH)
+                        bull_bos, bear_bos, res_level, sup_level, bos_time = detect_bos_structure(highs, lows, closes, times, SWING_STRENGTH)
                         
-                        if completed_time > last_alerted_candle.get(state_key, 0):
-                            if bull_bos:
-                                radar_states[state_key] = {'state': 'BOS_PENDING', 'level': res_level, 'dir': 'BULL', 'time': completed_time}
-                                last_alerted_candle[state_key] = completed_time
-                                logger.info(f"[{symbol} {tf_name}] VAIHE 1 LUKITTU: BULL BOS @ {res_level:.5f}")
-                                
-                                msg = (f"🔍 <b>Sniffer2: VAIHE 1 (BOS)</b>\n\n"
-                                       f"<b>Pari:</b> {symbol} | <b>TF:</b> {tf_name}\n"
-                                       f"🟢 BULLISH murtuma.\n"
-                                       f"<b>Lukittu taso:</b> <code>{res_level:.5f}</code>\n"
-                                       f"<i>Odotetaan vetäytymistä alueelle...</i>")
-                                send_telegram_alert(msg)
-                                
-                            elif bear_bos:
-                                radar_states[state_key] = {'state': 'BOS_PENDING', 'level': sup_level, 'dir': 'BEAR', 'time': completed_time}
-                                last_alerted_candle[state_key] = completed_time
-                                logger.info(f"[{symbol} {tf_name}] VAIHE 1 LUKITTU: BEAR BOS @ {sup_level:.5f}")
-                                
-                                msg = (f"🔍 <b>Sniffer2: VAIHE 1 (BOS)</b>\n\n"
-                                       f"<b>Pari:</b> {symbol} | <b>TF:</b> {tf_name}\n"
-                                       f"🔴 BEARISH murtuma.\n"
-                                       f"<b>Lukittu taso:</b> <code>{sup_level:.5f}</code>\n"
-                                       f"<i>Odotetaan vetäytymistä alueelle...</i>")
-                                send_telegram_alert(msg)
-                                
-                    # ---------------------------------------------------------
-                    # VAIHE 1.5: ODOTETAAN KOSKETUSTA VYÖHYKKEESEEN
-                    # ---------------------------------------------------------
-                    elif current_state == 'BOS_PENDING':
-                        target_level = radar_states[state_key]['level']
-                        direction = radar_states[state_key]['dir']
-                        
-                        # Aikalukko: Perutaan setup, jos kestää liian kauan
-                        candles_passed = (int(rates[-1]['time']) - radar_states[state_key]['time']) / max(1, tf_value)
-                        if candles_passed > MAX_WAIT_CANDLES:
-                            radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'time': 0}
-                            logger.info(f"[{symbol} {tf_name}] Setup peruttu (Aikalukko laukesi).")
-                            continue
+                        if bull_bos and bos_time > radar_states[state_key]['bos_time']:
+                            setup_id = f"#{symbol}_{tf_name}_{datetime.fromtimestamp(bos_time).strftime('%H%M')}"
+                            msg = (f"🔍 <b>Sniffer3: VAIHE 1 (BOS)</b>\n"
+                                   f"Tunniste: {setup_id}\n\n"
+                                   f"<b>{symbol} {tf_name}</b> | 🟢 BULLISH\n"
+                                   f"<b>Taso:</b> <code>{res_level:.5f}</code>\n"
+                                   f"<i>Odotetaan vetäytymistä...</i>")
+                            msg_id = send_telegram_alert(msg)
+                            radar_states[state_key] = {'state': 'BOS_PENDING', 'level': res_level, 'dir': 'BULL', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': msg_id, 'setup_id': setup_id}
                             
-                        if direction == 'BULL':
-                            if target_level - zone_buffer_out <= live_price <= target_level + zone_buffer_in:
-                                radar_states[state_key]['state'] = 'RETEST_TOUCHED'
-                                logger.warning(f"[{symbol} {tf_name}] Vyöhykettä kosketettu, odotetaan kimmoketta...")
-                            elif live_price < target_level - zone_buffer_out:
-                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'time': 0} # Suora Fake-out
-                                
-                        elif direction == 'BEAR':
-                            if target_level - zone_buffer_in <= live_price <= target_level + zone_buffer_out:
-                                radar_states[state_key]['state'] = 'RETEST_TOUCHED'
-                                logger.warning(f"[{symbol} {tf_name}] Vyöhykettä kosketettu, odotetaan kimmoketta...")
-                            elif live_price > target_level + zone_buffer_out:
-                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'time': 0}
+                        elif bear_bos and bos_time > radar_states[state_key]['bos_time']:
+                            setup_id = f"#{symbol}_{tf_name}_{datetime.fromtimestamp(bos_time).strftime('%H%M')}"
+                            msg = (f"🔍 <b>Sniffer3: VAIHE 1 (BOS)</b>\n"
+                                   f"Tunniste: {setup_id}\n\n"
+                                   f"<b>{symbol} {tf_name}</b> | 🔴 BEARISH\n"
+                                   f"<b>Taso:</b> <code>{sup_level:.5f}</code>\n"
+                                   f"<i>Odotetaan vetäytymistä...</i>")
+                            msg_id = send_telegram_alert(msg)
+                            radar_states[state_key] = {'state': 'BOS_PENDING', 'level': sup_level, 'dir': 'BEAR', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': msg_id, 'setup_id': setup_id}
 
-                    # ---------------------------------------------------------
-                    # VAIHE 2: ODOTETAAN KIMMOKETTA (BOUNCE) VYÖHYKKEELTÄ
-                    # ---------------------------------------------------------
-                    elif current_state == 'RETEST_TOUCHED':
+                    elif current_state in ['BOS_PENDING', 'RETEST_TOUCHED']:
                         target_level = radar_states[state_key]['level']
                         direction = radar_states[state_key]['dir']
+                        bos_time = radar_states[state_key]['bos_time']
+                        orig_msg_id = radar_states[state_key]['msg_id']
+                        setup_id = radar_states[state_key]['setup_id']
                         
-                        if direction == 'BULL':
-                            if live_price > target_level + zone_buffer_in: # Kimmoke ylös
-                                logger.info(f"🎯 [{symbol} {tf_name}] VAIHE 2 RETEST OK! Entry: {live_price:.5f}")
-                                msg = (f"🔥 <b>Sniffer2: VAIHE 2 (RETEST VAHVISTETTU)</b> 🔥\n\n"
-                                       f"<b>Pari:</b> {symbol} | <b>TF:</b> {tf_name}\n"
-                                       f"📈 Ostajat puolustivat tasoa, Kimmoke havaittu!\n"
-                                       f"<b>Entry (Kopioi):</b> <code>{live_price:.5f}</code>\n"
-                                       f"<b>Tuki (SL alle):</b> <code>{target_level:.5f}</code>\n\n"
-                                       f"<i>A+ Setup Valmis 1.5 Lot iskulle!</i>")
-                                send_telegram_alert(msg)
-                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'time': 0}
-                                
-                            elif live_price < target_level - zone_buffer_out: # Myöhäinen Fake-out
-                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'time': 0}
-                                
-                        elif direction == 'BEAR':
-                            if live_price < target_level - zone_buffer_in: # Kimmoke alas
-                                logger.info(f"🎯 [{symbol} {tf_name}] VAIHE 2 RETEST OK! Entry: {live_price:.5f}")
-                                msg = (f"🔥 <b>Sniffer2: VAIHE 2 (RETEST VAHVISTETTU)</b> 🔥\n\n"
-                                       f"<b>Pari:</b> {symbol} | <b>TF:</b> {tf_name}\n"
-                                       f"📉 Myyjät puolustivat tasoa, Kimmoke havaittu!\n"
-                                       f"<b>Entry (Kopioi):</b> <code>{live_price:.5f}</code>\n"
-                                       f"<b>Vastus (SL päälle):</b> <code>{target_level:.5f}</code>\n\n"
-                                       f"<i>A+ Setup Valmis 1.5 Lot iskulle!</i>")
-                                send_telegram_alert(msg)
-                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'time': 0}
-                                
-                            elif live_price > target_level + zone_buffer_out: # Myöhäinen Fake-out
-                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'time': 0}
+                        candles_passed = sum(1 for t in times if t >= bos_time) - 1
+                        if candles_passed > MAX_WAIT_CANDLES:
+                            radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
+                            continue
 
-            # Nuku määritetty aika ennen seuraavaa skannausta
+                        if direction == 'BULL':
+                            if live_price < target_level - zone_fake:
+                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
+                            elif current_state == 'BOS_PENDING' and live_price <= target_level + zone_appr:
+                                radar_states[state_key]['state'] = 'RETEST_TOUCHED'
+                                radar_states[state_key]['pivot'] = live_price
+                            elif current_state == 'RETEST_TOUCHED':
+                                if live_price < radar_states[state_key]['pivot']:
+                                    radar_states[state_key]['pivot'] = live_price
+                                if live_price >= radar_states[state_key]['pivot'] + bounce_req:
+                                    # UUTTA: Generoidaan kuva juuri ennen lähetystä!
+                                    chart_path = f"setup_{symbol}.png"
+                                    try:
+                                        # Otetaan 60 viimeistä kynttilää graafiin
+                                        generate_setup_chart(symbol, rates[-60:], target_level, radar_states[state_key]['pivot'], direction, chart_path)
+                                    except Exception as e:
+                                        logger.error(f"Graafin piirto epäonnistui: {e}")
+                                        chart_path = None
+                                        
+                                    msg = (f"🔥 <b>Sniffer3: VAIHE 2 (RETEST VAHVISTETTU)</b> 🔥\n\n"
+                                           f"Tunniste: {setup_id}\n"
+                                           f"<b>{symbol} {tf_name}</b> | 📈 Pivot-käännös ylös!\n"
+                                           f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
+                                           f"<b>Tuki (SL):</b> <code>{target_level:.5f}</code>")
+                                    
+                                    send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
+                                    radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
+
+                        elif direction == 'BEAR':
+                            if live_price > target_level + zone_fake:
+                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
+                            elif current_state == 'BOS_PENDING' and live_price >= target_level - zone_appr:
+                                radar_states[state_key]['state'] = 'RETEST_TOUCHED'
+                                radar_states[state_key]['pivot'] = live_price
+                            elif current_state == 'RETEST_TOUCHED':
+                                if live_price > radar_states[state_key]['pivot']:
+                                    radar_states[state_key]['pivot'] = live_price
+                                if live_price <= radar_states[state_key]['pivot'] - bounce_req:
+                                    # UUTTA: Generoidaan kuva juuri ennen lähetystä!
+                                    chart_path = f"setup_{symbol}.png"
+                                    try:
+                                        generate_setup_chart(symbol, rates[-60:], target_level, radar_states[state_key]['pivot'], direction, chart_path)
+                                    except Exception as e:
+                                        logger.error(f"Graafin piirto epäonnistui: {e}")
+                                        chart_path = None
+                                        
+                                    msg = (f"🔥 <b>Sniffer3: VAIHE 2 (RETEST VAHVISTETTU)</b> 🔥\n\n"
+                                           f"Tunniste: {setup_id}\n"
+                                           f"<b>{symbol} {tf_name}</b> | 📉 Pivot-käännös alas!\n"
+                                           f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
+                                           f"<b>Vastus (SL):</b> <code>{target_level:.5f}</code>")
+                                           
+                                    send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
+                                    radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
+
             time.sleep(SCAN_INTERVAL_SEC)
             
     except KeyboardInterrupt:
-        logger.info("Radar-haistelija sammutettu käyttäjän toimesta (Ctrl+C).")
-        send_telegram_alert("💤 <b>Sniffer2-tutka sammutettu taustalta.</b>")
-    except Exception as e:
-        logger.error(f"Kriittinen virhe pääsilmukassa: {e}", exc_info=True)
-        send_telegram_alert(f"⚠️ <b>Sniffer2 Virhe:</b> Järjestelmä kaatui: {e}")
+        logger.info("Sniffer3 sammutettu.")
     finally:
-        # Varmistetaan, että MT5-yhteys suljetaan siististi kaikissa tilanteissa
         mt5.shutdown()
-        logger.info("MT5 yhteys suljettu turvallisesti.")
 
 if __name__ == "__main__":
-    run_radar_sniffer()
+    run_sniffer3()
