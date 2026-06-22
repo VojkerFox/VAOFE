@@ -86,8 +86,12 @@ def send_telegram_alert(message: str, reply_to_msg_id: int = None, photo_path: s
                     return res_data["result"]["message_id"]
                 else:
                     logger.error(f"Telegram API hylkäsi kuvan: {res_data}")
+                    # FALLBACK: Jos kuva hylättiin, lähetetään edes pelkkä teksti!
+                    return send_telegram_alert(message, reply_to_msg_id=reply_to_msg_id)
             except Exception as e:
                 logger.error(f"Telegram kuvanlähetysvirhe: {e}")
+                # FALLBACK
+                return send_telegram_alert(message, reply_to_msg_id=reply_to_msg_id)
                 
     else:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -163,7 +167,7 @@ def run_sniffer3() -> None:
         return
         
     logger.info("🦅 SNIFFER 3: VISUAL SNIPER KÄYNNISTETTY 🦅")
-    send_telegram_alert("🦅 <b>Sniffer 3: VISUAL SNIPER KÄYNNISTETTY</b> 🦅\nUI-Päivitys: Asymmetrinen Swing-fysiikka aktivoitu. Nappaa nyt myös nopeat ryömintämurtumat!")
+    send_telegram_alert("🦅 <b>Sniffer 3: VISUAL SNIPER KÄYNNISTETTY</b> 🦅\nUI-Päivitys: B&R Laatikko-fysiikka aktivoitu! Riskilaskenta ja Targetit valmiina.")
     
     try:
         while True:
@@ -260,12 +264,10 @@ def run_sniffer3() -> None:
                         orig_msg_id = radar_states[state_key]['msg_id']
                         setup_id = radar_states[state_key]['setup_id']
                         
-                        # --- UUSI: STAIR-STEP LOGIIKKA (JATKUVAN RAKENTEEN PÄIVITYS) ---
-                        # Tarkistetaan, onko odotuksen aikana muodostunut UUSI murtuma (Stair-step)
+                        # --- STAIR-STEP LOGIIKKA (JATKUVAN RAKENTEEN PÄIVITYS) ---
                         new_bull_bos, new_bear_bos, new_res, new_sup, new_bos_time = detect_bos_structure(highs, lows, closes, times, LEFT_SWING_BARS, RIGHT_SWING_BARS)
                         
                         if direction == 'BULL' and new_bull_bos and new_bos_time > bos_time and new_res > target_level:
-                            # Markkina teki "portaan" ylöspäin! Päivitetään seurattava taso uuteen (keltainen viiva)
                             logger.info(f"[{symbol} {tf_name}] STAIR-STEP BULL: Taso päivitetty {target_level:.5f} -> {new_res:.5f}")
                             radar_states[state_key] = {'state': 'BOS_PENDING', 'level': new_res, 'dir': 'BULL', 'bos_time': new_bos_time, 'breakout_peak': live_price, 'pullback_extreme': live_price, 'msg_id': orig_msg_id, 'setup_id': setup_id}
                             
@@ -275,10 +277,9 @@ def run_sniffer3() -> None:
                                    f"<b>Uusi Tuki:</b> <code>{new_res:.5f}</code>\n"
                                    f"<i>Alkuperäinen BOS (sininen) hylätty. Momentum jatkuu, seurataan uutta ylempää porrasta (keltainen)...</i>")
                             send_telegram_alert(msg, reply_to_msg_id=orig_msg_id)
-                            continue # Aloitetaan uuden tason seuranta heti uuden luupin alusta
+                            continue 
 
                         elif direction == 'BEAR' and new_bear_bos and new_bos_time > bos_time and new_sup < target_level:
-                            # Markkina teki "portaan" alaspäin!
                             logger.info(f"[{symbol} {tf_name}] STAIR-STEP BEAR: Taso päivitetty {target_level:.5f} -> {new_sup:.5f}")
                             radar_states[state_key] = {'state': 'BOS_PENDING', 'level': new_sup, 'dir': 'BEAR', 'bos_time': new_bos_time, 'breakout_peak': live_price, 'pullback_extreme': live_price, 'msg_id': orig_msg_id, 'setup_id': setup_id}
                             
@@ -296,11 +297,12 @@ def run_sniffer3() -> None:
                             radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
                             continue
 
-                        min_pullback = 1.0 * pip_factor # Vähintään 1 pip vetäytyminen ("ei saa olla nolla")
-                        chop_tolerance = 1.5 * pip_factor # UUSI: Konsolidointi-toleranssi!
+                        # AITO PULLBACK VAATIMUS (Poistaa massiivisen kynttilän sisäisen mikrotärinän hälytykset)
+                        min_pullback = max(MIN_BOUNCE_PIPS * pip_factor, current_atr * 0.4) 
+                        chop_tolerance = max(2.0 * pip_factor, current_atr * 0.15) 
 
                         if direction == 'BULL':
-                            # UUSI LOGIIKKA: Nollataan extreme vasta, kun tehdään oikeasti uusi merkittävä huippu, ei mikrosahauksesta.
+                            # Nollataan extreme vasta, kun tehdään oikeasti uusi merkittävä huippu, ei mikrosahauksesta.
                             if live_price > radar_states[state_key]['breakout_peak'] + chop_tolerance:
                                 radar_states[state_key]['breakout_peak'] = live_price
                                 radar_states[state_key]['pullback_extreme'] = live_price
@@ -314,6 +316,7 @@ def run_sniffer3() -> None:
                             pullback_depth = radar_states[state_key]['breakout_peak'] - radar_states[state_key]['pullback_extreme']
                             
                             if pullback_depth >= min_pullback and live_price >= radar_states[state_key]['pullback_extreme'] + bounce_req:
+                                logger.info(f"🎯 [{symbol} {tf_name}] KIMMOKE LAUKESI! A+ Setup.")
                                 chart_path = f"setup_{symbol}.png"
                                 try:
                                     generate_setup_chart(symbol, rates[-60:], target_level, radar_states[state_key]['pullback_extreme'], direction, chart_path)
@@ -321,22 +324,31 @@ def run_sniffer3() -> None:
                                     logger.error(f"Graafin piirto epäonnistui: {e}")
                                     chart_path = None
                                     
+                                # LASKETAAN B&R LAATIKON KOKO JA TARGETIT
+                                box_size_pips = (live_price - radar_states[state_key]['pullback_extreme']) / pip_factor
+                                tp1 = live_price + (live_price - radar_states[state_key]['pullback_extreme'])
+                                tp2 = live_price + 2 * (live_price - radar_states[state_key]['pullback_extreme'])
+                                
                                 msg = (f"🔥 <b>Sniffer3: VAIHE 2 (KIMMOKE VAHVISTETTU)</b> 🔥\n\n"
                                        f"Tunniste: {setup_id}\n"
-                                       f"<b>{symbol} {tf_name}</b> | 📈 Momentum jatkuu!\n"
+                                       f"<b>{symbol} {tf_name}</b> | 📈 B&R Laatikko Lukittu!\n"
                                        f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
-                                       f"<b>Tuki (SL):</b> <code>{target_level:.5f}</code>")
+                                       f"<b>Stop Loss (Pohja):</b> <code>{radar_states[state_key]['pullback_extreme']:.5f}</code>\n"
+                                       f"<b>Riski:</b> {box_size_pips:.1f} pips\n\n"
+                                       f"🎯 <b>Target 1:1 (BE):</b> <code>{tp1:.5f}</code>\n"
+                                       f"🎯 <b>Target 1:2 (Voitto):</b> <code>{tp2:.5f}</code>")
                                 
                                 send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
                                 try:
-                                    log_trade_signal(symbol, tf_name, "BULL", live_price, target_level)
+                                    # Huom! Nyt tietokantaankin tallennetaan B&R pohja SL:nä, ei alkuperäistä murtumatasoa!
+                                    log_trade_signal(symbol, tf_name, "BULL", live_price, radar_states[state_key]['pullback_extreme'])
                                 except Exception as e:
                                     logger.error(f"Tietokantatallennus epäonnistui: {e}")
                                     
                                 radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
 
                         elif direction == 'BEAR':
-                            # UUSI LOGIIKKA: Nollataan extreme vasta, kun tehdään oikeasti uusi merkittävä pohja.
+                            # Nollataan extreme vasta, kun tehdään oikeasti uusi merkittävä pohja.
                             if live_price < radar_states[state_key]['breakout_peak'] - chop_tolerance:
                                 radar_states[state_key]['breakout_peak'] = live_price
                                 radar_states[state_key]['pullback_extreme'] = live_price
@@ -350,6 +362,7 @@ def run_sniffer3() -> None:
                             pullback_depth = radar_states[state_key]['pullback_extreme'] - radar_states[state_key]['breakout_peak']
                             
                             if pullback_depth >= min_pullback and live_price <= radar_states[state_key]['pullback_extreme'] - bounce_req:
+                                logger.info(f"🎯 [{symbol} {tf_name}] KIMMOKE LAUKESI! A+ Setup.")
                                 chart_path = f"setup_{symbol}.png"
                                 try:
                                     generate_setup_chart(symbol, rates[-60:], target_level, radar_states[state_key]['pullback_extreme'], direction, chart_path)
@@ -357,15 +370,24 @@ def run_sniffer3() -> None:
                                     logger.error(f"Graafin piirto epäonnistui: {e}")
                                     chart_path = None
                                     
+                                # LASKETAAN B&R LAATIKON KOKO JA TARGETIT
+                                box_size_pips = (radar_states[state_key]['pullback_extreme'] - live_price) / pip_factor
+                                tp1 = live_price - (radar_states[state_key]['pullback_extreme'] - live_price)
+                                tp2 = live_price - 2 * (radar_states[state_key]['pullback_extreme'] - live_price)
+                                
                                 msg = (f"🔥 <b>Sniffer3: VAIHE 2 (KIMMOKE VAHVISTETTU)</b> 🔥\n\n"
                                        f"Tunniste: {setup_id}\n"
-                                       f"<b>{symbol} {tf_name}</b> | 📉 Momentum jatkuu!\n"
+                                       f"<b>{symbol} {tf_name}</b> | 📉 B&R Laatikko Lukittu!\n"
                                        f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
-                                       f"<b>Vastus (SL):</b> <code>{target_level:.5f}</code>")
+                                       f"<b>Stop Loss (Huippu):</b> <code>{radar_states[state_key]['pullback_extreme']:.5f}</code>\n"
+                                       f"<b>Riski:</b> {box_size_pips:.1f} pips\n\n"
+                                       f"🎯 <b>Target 1:1 (BE):</b> <code>{tp1:.5f}</code>\n"
+                                       f"🎯 <b>Target 1:2 (Voitto):</b> <code>{tp2:.5f}</code>")
                                        
                                 send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
                                 try:
-                                    log_trade_signal(symbol, tf_name, "BEAR", live_price, target_level)
+                                    # Huom! Nyt tietokantaankin tallennetaan B&R huippu SL:nä, ei alkuperäistä murtumatasoa!
+                                    log_trade_signal(symbol, tf_name, "BEAR", live_price, radar_states[state_key]['pullback_extreme'])
                                 except Exception as e:
                                     logger.error(f"Tietokantatallennus epäonnistui: {e}")
                                     
