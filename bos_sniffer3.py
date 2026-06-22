@@ -293,12 +293,20 @@ def run_sniffer3() -> None:
 
                         # --- NORMAALI ODOTUSLOGIIKKA JATKUU ---
                         candles_passed = sum(1 for t in times if t >= bos_time) - 1
+                        
+                        # 1. AIKASUODATIN: B&R ei koskaan tapahdu saman kynttilän sekunneilla!
+                        if candles_passed < 1:
+                            continue 
+                            
                         if candles_passed > MAX_WAIT_CANDLES:
                             radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
                             continue
 
-                        # AITO PULLBACK VAATIMUS (Poistaa massiivisen kynttilän sisäisen mikrotärinän hälytykset)
-                        min_pullback = max(MIN_BOUNCE_PIPS * pip_factor, current_atr * 0.4) 
+                        # 2. RAKENTEELLINEN VETÄYTYMINEN (Estää mid-air mikrotärinät)
+                        breakout_push = abs(radar_states[state_key]['breakout_peak'] - target_level)
+                        structural_pullback_req = breakout_push * 0.35 # Vaatii vähintään 35% palautumisen laatikon sisään
+                        
+                        min_pullback = max(MIN_BOUNCE_PIPS * pip_factor, current_atr * 0.4, structural_pullback_req) 
                         chop_tolerance = max(2.0 * pip_factor, current_atr * 0.15) 
 
                         if direction == 'BULL':
@@ -324,24 +332,23 @@ def run_sniffer3() -> None:
                                     logger.error(f"Graafin piirto epäonnistui: {e}")
                                     chart_path = None
                                     
-                                # LASKETAAN B&R LAATIKON KOKO JA TARGETIT
-                                box_size_pips = (live_price - radar_states[state_key]['pullback_extreme']) / pip_factor
-                                tp1 = live_price + (live_price - radar_states[state_key]['pullback_extreme'])
-                                tp2 = live_price + 2 * (live_price - radar_states[state_key]['pullback_extreme'])
+                                # 3. PALAUTETTU OIKEA RISKI-GEOMETRIA (SL = BOS Taso, Ei random pohja)
+                                risk_pips = (live_price - target_level) / pip_factor
+                                tp1 = live_price + (live_price - target_level)
+                                tp2 = live_price + 2 * (live_price - target_level)
                                 
                                 msg = (f"🔥 <b>Sniffer3: VAIHE 2 (KIMMOKE VAHVISTETTU)</b> 🔥\n\n"
                                        f"Tunniste: {setup_id}\n"
                                        f"<b>{symbol} {tf_name}</b> | 📈 B&R Laatikko Lukittu!\n"
                                        f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
-                                       f"<b>Stop Loss (Pohja):</b> <code>{radar_states[state_key]['pullback_extreme']:.5f}</code>\n"
-                                       f"<b>Riski:</b> {box_size_pips:.1f} pips\n\n"
+                                       f"<b>Stop Loss (BOS Taso):</b> <code>{target_level:.5f}</code>\n"
+                                       f"<b>Riski (Laatikko):</b> {risk_pips:.1f} pips\n\n"
                                        f"🎯 <b>Target 1:1 (BE):</b> <code>{tp1:.5f}</code>\n"
                                        f"🎯 <b>Target 1:2 (Voitto):</b> <code>{tp2:.5f}</code>")
                                 
                                 send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
                                 try:
-                                    # Huom! Nyt tietokantaankin tallennetaan B&R pohja SL:nä, ei alkuperäistä murtumatasoa!
-                                    log_trade_signal(symbol, tf_name, "BULL", live_price, radar_states[state_key]['pullback_extreme'])
+                                    log_trade_signal(symbol, tf_name, "BULL", live_price, target_level)
                                 except Exception as e:
                                     logger.error(f"Tietokantatallennus epäonnistui: {e}")
                                     
@@ -370,24 +377,23 @@ def run_sniffer3() -> None:
                                     logger.error(f"Graafin piirto epäonnistui: {e}")
                                     chart_path = None
                                     
-                                # LASKETAAN B&R LAATIKON KOKO JA TARGETIT
-                                box_size_pips = (radar_states[state_key]['pullback_extreme'] - live_price) / pip_factor
-                                tp1 = live_price - (radar_states[state_key]['pullback_extreme'] - live_price)
-                                tp2 = live_price - 2 * (radar_states[state_key]['pullback_extreme'] - live_price)
+                                # 3. PALAUTETTU OIKEA RISKI-GEOMETRIA (SL = BOS Taso, Ei random huippu)
+                                risk_pips = (target_level - live_price) / pip_factor
+                                tp1 = live_price - (target_level - live_price)
+                                tp2 = live_price - 2 * (target_level - live_price)
                                 
                                 msg = (f"🔥 <b>Sniffer3: VAIHE 2 (KIMMOKE VAHVISTETTU)</b> 🔥\n\n"
                                        f"Tunniste: {setup_id}\n"
                                        f"<b>{symbol} {tf_name}</b> | 📉 B&R Laatikko Lukittu!\n"
                                        f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
-                                       f"<b>Stop Loss (Huippu):</b> <code>{radar_states[state_key]['pullback_extreme']:.5f}</code>\n"
-                                       f"<b>Riski:</b> {box_size_pips:.1f} pips\n\n"
+                                       f"<b>Stop Loss (BOS Taso):</b> <code>{target_level:.5f}</code>\n"
+                                       f"<b>Riski (Laatikko):</b> {risk_pips:.1f} pips\n\n"
                                        f"🎯 <b>Target 1:1 (BE):</b> <code>{tp1:.5f}</code>\n"
                                        f"🎯 <b>Target 1:2 (Voitto):</b> <code>{tp2:.5f}</code>")
                                        
                                 send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
                                 try:
-                                    # Huom! Nyt tietokantaankin tallennetaan B&R huippu SL:nä, ei alkuperäistä murtumatasoa!
-                                    log_trade_signal(symbol, tf_name, "BEAR", live_price, radar_states[state_key]['pullback_extreme'])
+                                    log_trade_signal(symbol, tf_name, "BEAR", live_price, target_level)
                                 except Exception as e:
                                     logger.error(f"Tietokantatallennus epäonnistui: {e}")
                                     
