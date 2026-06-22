@@ -41,11 +41,16 @@ TIMEFRAMES = {
 }
 
 SWING_STRENGTH = 10
-RETEST_APPROACH_PIPS = 8.0
-BOUNCE_CONFIRM_PIPS = 3.5
-FAKE_OUT_PIPS = 8.0
 MAX_WAIT_CANDLES = 24
 SCAN_INTERVAL_SEC = 3
+
+# UUDET DYNAAMISET ASETUKSET (Elonin Askel 1: Make less dumb)
+MIN_BOUNCE_PIPS = 3.0       # Lattia (Kohinan suodatus)
+MAX_BOUNCE_PIPS = 22.0      # Katto (Uutiskaaoksen suodatus)
+ATR_MULTIPLIER = 0.50       # Kimmokkeen tulee olla 50% ATR:stä
+FAKEOUT_MULTIPLIER = 1.2    # Sallii 120% ATR:n kokoisen liquidity sweepin läpi tason
+# POISTETTU: Kaikki "Approach" (Kosketusvyöhyke) rajat, koska hinta ei tottele niitä. 
+# Nyt vaaditaan vain > 0 vetäytyminen ja kimmoke.
 
 # ==========================================
 # 2. LOGGING & TELEGRAM KUVANLÄHETYS
@@ -58,29 +63,15 @@ radar_states: Dict[str, Dict[str, Any]] = {}
 
 def send_telegram_alert(message: str, reply_to_msg_id: int = None, photo_path: str = None, symbol: str = None) -> int:
     """
-    Lähettää joko pelkän tekstin (Vaihe 1) TAI kuvan + painikkeet (Vaihe 2).
+    Lähettää joko pelkän tekstin (Vaihe 1) TAI kuvan (Vaihe 2).
     """
-    # Jos on kuva, käytetään sendPhoto-endpointia
     if photo_path and os.path.exists(photo_path):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        
-        # Luodaan Action-painikkeet
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": f"🟢 Avaa MT5 ({symbol})", "url": f"tg://resolve?domain=mt5"} 
-                ],
-                [
-                    {"text": "📊 Avaa VAOFE Dashboard", "url": "http://localhost:8501"}
-                ]
-            ]
-        }
         
         data = {
             "chat_id": TELEGRAM_CHAT_ID,
             "caption": message,
-            "parse_mode": "HTML",
-            "reply_markup": json.dumps(keyboard)
+            "parse_mode": "HTML"
         }
         
         if reply_to_msg_id:
@@ -93,10 +84,11 @@ def send_telegram_alert(message: str, reply_to_msg_id: int = None, photo_path: s
                 res_data = response.json()
                 if res_data.get("ok"):
                     return res_data["result"]["message_id"]
+                else:
+                    logger.error(f"Telegram API hylkäsi kuvan: {res_data}")
             except Exception as e:
                 logger.error(f"Telegram kuvanlähetysvirhe: {e}")
                 
-    # Jos EI ole kuvaa (Vaihe 1), käytetään tavallista sendMessage-endpointia
     else:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
@@ -164,7 +156,7 @@ def run_sniffer3() -> None:
         return
         
     logger.info("🦅 SNIFFER 3: VISUAL SNIPER KÄYNNISTETTY 🦅")
-    send_telegram_alert("🦅 <b>Sniffer 3: VISUAL SNIPER KÄYNNISTETTY</b> 🦅\nUI-Päivitys: Graafit, Tracker ja Reply-ketjutus aktivoitu!")
+    send_telegram_alert("🦅 <b>Sniffer 3: VISUAL SNIPER KÄYNNISTETTY</b> 🦅\nUI-Päivitys: Täydellinen Momentum-kimmoke (Ei Approach-rajoja) aktivoitu!")
     
     try:
         while True:
@@ -172,23 +164,10 @@ def run_sniffer3() -> None:
                 if mt5.symbol_info(symbol) is None: continue
                 pip_factor = get_pip_size(symbol)
                 
-                if "XAU" in symbol or "GOLD" in symbol:
-                    zone_appr = 20.0 * pip_factor  
-                    bounce_req = 5.0 * pip_factor  
-                    zone_fake = 15.0 * pip_factor  
-                elif "BTC" in symbol:
-                    zone_appr = 150.0 * pip_factor
-                    bounce_req = 50.0 * pip_factor
-                    zone_fake = 100.0 * pip_factor
-                else:
-                    zone_appr = RETEST_APPROACH_PIPS * pip_factor
-                    bounce_req = BOUNCE_CONFIRM_PIPS * pip_factor
-                    zone_fake = FAKE_OUT_PIPS * pip_factor
-                
                 for tf_name, tf_value in TIMEFRAMES.items():
                     state_key = f"{symbol}_{tf_name}"
                     if state_key not in radar_states:
-                        radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': 0, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
+                        radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': 0, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
                         
                     rates = mt5.copy_rates_from_pos(symbol, tf_value, 0, 150)
                     if rates is None or len(rates) < 100: continue
@@ -198,6 +177,31 @@ def run_sniffer3() -> None:
                     closes = jnp.array([r['close'] for r in rates])
                     times = [int(r['time']) for r in rates]
                     
+                    # ----------------------------------------------------
+                    # DYNAAMISET FYSIKAN RAJAT (ATR)
+                    # ----------------------------------------------------
+                    recent_ranges = highs[-14:] - lows[-14:]
+                    current_atr = float(jnp.mean(recent_ranges))
+                    
+                    raw_bounce_req = current_atr * ATR_MULTIPLIER
+                    raw_fake_out = current_atr * FAKEOUT_MULTIPLIER
+                    
+                    if "XAU" in symbol or "GOLD" in symbol:
+                        min_req = 5.0 * pip_factor
+                        max_req = 20.0 * pip_factor
+                        zone_fake = max(15.0 * pip_factor, raw_fake_out)
+                    elif "BTC" in symbol:
+                        min_req = 50.0 * pip_factor
+                        max_req = 200.0 * pip_factor
+                        zone_fake = max(150.0 * pip_factor, raw_fake_out)
+                    else:
+                        min_req = MIN_BOUNCE_PIPS * pip_factor
+                        max_req = MAX_BOUNCE_PIPS * pip_factor
+                        zone_fake = max(8.0 * pip_factor, raw_fake_out) 
+                        
+                    bounce_req = max(min_req, min(raw_bounce_req, max_req))
+                    # ----------------------------------------------------
+
                     live_price = float(rates[-1]['close']) 
                     current_state = radar_states[state_key]['state']
                     
@@ -206,25 +210,43 @@ def run_sniffer3() -> None:
                         
                         if bull_bos and bos_time > radar_states[state_key]['bos_time']:
                             setup_id = f"#{symbol}_{tf_name}_{datetime.fromtimestamp(bos_time).strftime('%H%M')}"
+                            
+                            chart_path = f"bos_{symbol}.png"
+                            try:
+                                generate_setup_chart(symbol, rates[-60:], res_level, live_price, "BULL", chart_path)
+                            except Exception as e:
+                                logger.error(f"Vaihe 1 graafin piirto epäonnistui: {e}")
+                                chart_path = None
+
                             msg = (f"🔍 <b>Sniffer3: VAIHE 1 (BOS)</b>\n"
                                    f"Tunniste: {setup_id}\n\n"
                                    f"<b>{symbol} {tf_name}</b> | 🟢 BULLISH\n"
                                    f"<b>Taso:</b> <code>{res_level:.5f}</code>\n"
                                    f"<i>Odotetaan vetäytymistä...</i>")
-                            msg_id = send_telegram_alert(msg)
-                            radar_states[state_key] = {'state': 'BOS_PENDING', 'level': res_level, 'dir': 'BULL', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': msg_id, 'setup_id': setup_id}
+                            
+                            msg_id = send_telegram_alert(msg, photo_path=chart_path, symbol=symbol)
+                            radar_states[state_key] = {'state': 'BOS_PENDING', 'level': res_level, 'dir': 'BULL', 'bos_time': bos_time, 'breakout_peak': live_price, 'pullback_extreme': live_price, 'msg_id': msg_id, 'setup_id': setup_id}
                             
                         elif bear_bos and bos_time > radar_states[state_key]['bos_time']:
                             setup_id = f"#{symbol}_{tf_name}_{datetime.fromtimestamp(bos_time).strftime('%H%M')}"
+                            
+                            chart_path = f"bos_{symbol}.png"
+                            try:
+                                generate_setup_chart(symbol, rates[-60:], sup_level, live_price, "BEAR", chart_path)
+                            except Exception as e:
+                                logger.error(f"Vaihe 1 graafin piirto epäonnistui: {e}")
+                                chart_path = None
+
                             msg = (f"🔍 <b>Sniffer3: VAIHE 1 (BOS)</b>\n"
                                    f"Tunniste: {setup_id}\n\n"
                                    f"<b>{symbol} {tf_name}</b> | 🔴 BEARISH\n"
                                    f"<b>Taso:</b> <code>{sup_level:.5f}</code>\n"
                                    f"<i>Odotetaan vetäytymistä...</i>")
-                            msg_id = send_telegram_alert(msg)
-                            radar_states[state_key] = {'state': 'BOS_PENDING', 'level': sup_level, 'dir': 'BEAR', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': msg_id, 'setup_id': setup_id}
+                            
+                            msg_id = send_telegram_alert(msg, photo_path=chart_path, symbol=symbol)
+                            radar_states[state_key] = {'state': 'BOS_PENDING', 'level': sup_level, 'dir': 'BEAR', 'bos_time': bos_time, 'breakout_peak': live_price, 'pullback_extreme': live_price, 'msg_id': msg_id, 'setup_id': setup_id}
 
-                    elif current_state in ['BOS_PENDING', 'RETEST_TOUCHED']:
+                    elif current_state == 'BOS_PENDING':
                         target_level = radar_states[state_key]['level']
                         direction = radar_states[state_key]['dir']
                         bos_time = radar_states[state_key]['bos_time']
@@ -233,73 +255,80 @@ def run_sniffer3() -> None:
                         
                         candles_passed = sum(1 for t in times if t >= bos_time) - 1
                         if candles_passed > MAX_WAIT_CANDLES:
-                            radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
+                            radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
                             continue
 
+                        min_pullback = 1.0 * pip_factor # Vähintään 1 pip vetäytyminen ("ei saa olla nolla")
+
                         if direction == 'BULL':
+                            if live_price > radar_states[state_key]['breakout_peak']:
+                                radar_states[state_key]['breakout_peak'] = live_price
+                                radar_states[state_key]['pullback_extreme'] = live_price
+                            elif live_price < radar_states[state_key]['pullback_extreme']:
+                                radar_states[state_key]['pullback_extreme'] = live_price
+
                             if live_price < target_level - zone_fake:
-                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
-                            elif current_state == 'BOS_PENDING' and live_price <= target_level + zone_appr:
-                                radar_states[state_key]['state'] = 'RETEST_TOUCHED'
-                                radar_states[state_key]['pivot'] = live_price
-                            elif current_state == 'RETEST_TOUCHED':
-                                if live_price < radar_states[state_key]['pivot']:
-                                    radar_states[state_key]['pivot'] = live_price
-                                if live_price >= radar_states[state_key]['pivot'] + bounce_req:
-                                    chart_path = f"setup_{symbol}.png"
-                                    try:
-                                        # Otetaan 60 viimeistä kynttilää graafiin
-                                        generate_setup_chart(symbol, rates[-60:], target_level, radar_states[state_key]['pivot'], direction, chart_path)
-                                    except Exception as e:
-                                        logger.error(f"Graafin piirto epäonnistui: {e}")
-                                        chart_path = None
-                                        
-                                    msg = (f"🔥 <b>Sniffer3: VAIHE 2 (RETEST VAHVISTETTU)</b> 🔥\n\n"
-                                           f"Tunniste: {setup_id}\n"
-                                           f"<b>{symbol} {tf_name}</b> | 📈 Pivot-käännös ylös!\n"
-                                           f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
-                                           f"<b>Tuki (SL):</b> <code>{target_level:.5f}</code>")
+                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
+                                continue
+
+                            pullback_depth = radar_states[state_key]['breakout_peak'] - radar_states[state_key]['pullback_extreme']
+                            
+                            if pullback_depth >= min_pullback and live_price >= radar_states[state_key]['pullback_extreme'] + bounce_req:
+                                chart_path = f"setup_{symbol}.png"
+                                try:
+                                    generate_setup_chart(symbol, rates[-60:], target_level, radar_states[state_key]['pullback_extreme'], direction, chart_path)
+                                except Exception as e:
+                                    logger.error(f"Graafin piirto epäonnistui: {e}")
+                                    chart_path = None
                                     
-                                    # LÄHETETÄÄN VIESTI JA TALLENNETAAN KANTAAN
-                                    send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
-                                    try:
-                                        log_trade_signal(symbol, tf_name, "BULL", live_price, target_level)
-                                    except Exception as e:
-                                        logger.error(f"Tietokantatallennus epäonnistui: {e}")
-                                        
-                                    radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
+                                msg = (f"🔥 <b>Sniffer3: VAIHE 2 (KIMMOKE VAHVISTETTU)</b> 🔥\n\n"
+                                       f"Tunniste: {setup_id}\n"
+                                       f"<b>{symbol} {tf_name}</b> | 📈 Momentum jatkuu!\n"
+                                       f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
+                                       f"<b>Tuki (SL):</b> <code>{target_level:.5f}</code>")
+                                
+                                send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
+                                try:
+                                    log_trade_signal(symbol, tf_name, "BULL", live_price, target_level)
+                                except Exception as e:
+                                    logger.error(f"Tietokantatallennus epäonnistui: {e}")
+                                    
+                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
 
                         elif direction == 'BEAR':
+                            if live_price < radar_states[state_key]['breakout_peak']:
+                                radar_states[state_key]['breakout_peak'] = live_price
+                                radar_states[state_key]['pullback_extreme'] = live_price
+                            elif live_price > radar_states[state_key]['pullback_extreme']:
+                                radar_states[state_key]['pullback_extreme'] = live_price
+
                             if live_price > target_level + zone_fake:
-                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
-                            elif current_state == 'BOS_PENDING' and live_price >= target_level - zone_appr:
-                                radar_states[state_key]['state'] = 'RETEST_TOUCHED'
-                                radar_states[state_key]['pivot'] = live_price
-                            elif current_state == 'RETEST_TOUCHED':
-                                if live_price > radar_states[state_key]['pivot']:
-                                    radar_states[state_key]['pivot'] = live_price
-                                if live_price <= radar_states[state_key]['pivot'] - bounce_req:
-                                    chart_path = f"setup_{symbol}.png"
-                                    try:
-                                        generate_setup_chart(symbol, rates[-60:], target_level, radar_states[state_key]['pivot'], direction, chart_path)
-                                    except Exception as e:
-                                        logger.error(f"Graafin piirto epäonnistui: {e}")
-                                        chart_path = None
-                                        
-                                    msg = (f"🔥 <b>Sniffer3: VAIHE 2 (RETEST VAHVISTETTU)</b> 🔥\n\n"
-                                           f"Tunniste: {setup_id}\n"
-                                           f"<b>{symbol} {tf_name}</b> | 📉 Pivot-käännös alas!\n"
-                                           f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
-                                           f"<b>Vastus (SL):</b> <code>{target_level:.5f}</code>")
-                                           
-                                    # LÄHETETÄÄN VIESTI JA TALLENNETAAN KANTAAN
-                                    send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
-                                    try:
-                                        log_trade_signal(symbol, tf_name, "BEAR", live_price, target_level)
-                                    except Exception as e:
-                                        logger.error(f"Tietokantatallennus epäonnistui: {e}")
-                                        
-                                    radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'pivot': 0.0, 'msg_id': 0, 'setup_id': ''}
+                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
+                                continue
+
+                            pullback_depth = radar_states[state_key]['pullback_extreme'] - radar_states[state_key]['breakout_peak']
+                            
+                            if pullback_depth >= min_pullback and live_price <= radar_states[state_key]['pullback_extreme'] - bounce_req:
+                                chart_path = f"setup_{symbol}.png"
+                                try:
+                                    generate_setup_chart(symbol, rates[-60:], target_level, radar_states[state_key]['pullback_extreme'], direction, chart_path)
+                                except Exception as e:
+                                    logger.error(f"Graafin piirto epäonnistui: {e}")
+                                    chart_path = None
+                                    
+                                msg = (f"🔥 <b>Sniffer3: VAIHE 2 (KIMMOKE VAHVISTETTU)</b> 🔥\n\n"
+                                       f"Tunniste: {setup_id}\n"
+                                       f"<b>{symbol} {tf_name}</b> | 📉 Momentum jatkuu!\n"
+                                       f"<b>Entry:</b> <code>{live_price:.5f}</code>\n"
+                                       f"<b>Vastus (SL):</b> <code>{target_level:.5f}</code>")
+                                       
+                                send_telegram_alert(msg, reply_to_msg_id=orig_msg_id, photo_path=chart_path, symbol=symbol)
+                                try:
+                                    log_trade_signal(symbol, tf_name, "BEAR", live_price, target_level)
+                                except Exception as e:
+                                    logger.error(f"Tietokantatallennus epäonnistui: {e}")
+                                    
+                                radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
 
             time.sleep(SCAN_INTERVAL_SEC)
             
