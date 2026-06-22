@@ -40,8 +40,10 @@ TIMEFRAMES = {
     "M30": mt5.TIMEFRAME_M30
 }
 
-SWING_STRENGTH = 10
-MAX_WAIT_CANDLES = 24
+# --- ASYMMETRINEN RAKENNEFYSIIKKA (UUSI) ---
+LEFT_SWING_BARS = 15        # Vaatii pitkän historian vasemmalle (rakentaa vahvan tason)
+RIGHT_SWING_BARS = 2        # Vaatii vain 2 kynttilää oikealle (sallii nopeat/ryömivät murtumat!)
+MAX_WAIT_CANDLES = 72       # KORJATTU: Nostettu 72 kynttilään (6 tuntia). Antaa hinnan konsolidoida rauhassa!
 SCAN_INTERVAL_SEC = 3
 
 # UUDET DYNAAMISET ASETUKSET (Elonin Askel 1: Make less dumb)
@@ -49,8 +51,6 @@ MIN_BOUNCE_PIPS = 3.0       # Lattia (Kohinan suodatus)
 MAX_BOUNCE_PIPS = 22.0      # Katto (Uutiskaaoksen suodatus)
 ATR_MULTIPLIER = 0.50       # Kimmokkeen tulee olla 50% ATR:stä
 FAKEOUT_MULTIPLIER = 1.2    # Sallii 120% ATR:n kokoisen liquidity sweepin läpi tason
-# POISTETTU: Kaikki "Approach" (Kosketusvyöhyke) rajat, koska hinta ei tottele niitä. 
-# Nyt vaaditaan vain > 0 vetäytyminen ja kimmoke.
 
 # ==========================================
 # 2. LOGGING & TELEGRAM KUVANLÄHETYS
@@ -113,18 +113,21 @@ def get_pip_size(pair: str) -> float:
     return 0.0001
 
 # ==========================================
-# 3. JAX RAKENNETUNNISTUS 
+# 3. JAX RAKENNETUNNISTUS (ASYMMETRINEN)
 # ==========================================
-def detect_bos_structure(highs: jnp.ndarray, lows: jnp.ndarray, closes: jnp.ndarray, times: list, strength: int = 10):
+def detect_bos_structure(highs: jnp.ndarray, lows: jnp.ndarray, closes: jnp.ndarray, times: list, left_bars: int = 15, right_bars: int = 2):
     hist_h = highs[:-1]
     hist_l = lows[:-1]
     recent_swing_high, recent_swing_low = float('inf'), 0.0
     found_h, found_l = False, False
-    start_idx = len(hist_h) - strength - 1
-    if start_idx >= strength:
-        for i in range(start_idx, strength - 1, -1):
-            window_h = hist_h[i - strength : i + strength + 1]
-            window_l = hist_l[i - strength : i + strength + 1]
+    
+    # Asymmetrinen ikkuna mahdollistaa äkilliset murtumat konsolidaation jälkeen
+    start_idx = len(hist_h) - right_bars - 1
+    if start_idx >= left_bars:
+        for i in range(start_idx, left_bars - 1, -1):
+            window_h = hist_h[i - left_bars : i + right_bars + 1]
+            window_l = hist_l[i - left_bars : i + right_bars + 1]
+            
             if not found_h and hist_h[i] == jnp.max(window_h):
                 recent_swing_high = float(hist_h[i])
                 found_h = True
@@ -132,10 +135,13 @@ def detect_bos_structure(highs: jnp.ndarray, lows: jnp.ndarray, closes: jnp.ndar
                 recent_swing_low = float(hist_l[i])
                 found_l = True
             if found_h and found_l: break
+            
     if not found_h: recent_swing_high = float(jnp.max(hist_h))
     if not found_l: recent_swing_low = float(jnp.min(hist_l))
+    
     bull_bos, bear_bos = False, False
     bos_time = 0
+    
     for i in range(-4, -1):
         prev_c = float(closes[i-1])
         curr_c = float(closes[i])
@@ -145,6 +151,7 @@ def detect_bos_structure(highs: jnp.ndarray, lows: jnp.ndarray, closes: jnp.ndar
         elif prev_c >= recent_swing_low and curr_c < recent_swing_low:
             bear_bos, bull_bos = True, False
             bos_time = times[i]
+            
     return bull_bos, bear_bos, recent_swing_high, recent_swing_low, bos_time
 
 # ==========================================
@@ -156,7 +163,7 @@ def run_sniffer3() -> None:
         return
         
     logger.info("🦅 SNIFFER 3: VISUAL SNIPER KÄYNNISTETTY 🦅")
-    send_telegram_alert("🦅 <b>Sniffer 3: VISUAL SNIPER KÄYNNISTETTY</b> 🦅\nUI-Päivitys: Täydellinen Momentum-kimmoke (Ei Approach-rajoja) aktivoitu!")
+    send_telegram_alert("🦅 <b>Sniffer 3: VISUAL SNIPER KÄYNNISTETTY</b> 🦅\nUI-Päivitys: Asymmetrinen Swing-fysiikka aktivoitu. Nappaa nyt myös nopeat ryömintämurtumat!")
     
     try:
         while True:
@@ -206,7 +213,7 @@ def run_sniffer3() -> None:
                     current_state = radar_states[state_key]['state']
                     
                     if current_state == 'IDLE':
-                        bull_bos, bear_bos, res_level, sup_level, bos_time = detect_bos_structure(highs, lows, closes, times, SWING_STRENGTH)
+                        bull_bos, bear_bos, res_level, sup_level, bos_time = detect_bos_structure(highs, lows, closes, times, LEFT_SWING_BARS, RIGHT_SWING_BARS)
                         
                         if bull_bos and bos_time > radar_states[state_key]['bos_time']:
                             setup_id = f"#{symbol}_{tf_name}_{datetime.fromtimestamp(bos_time).strftime('%H%M')}"
@@ -253,15 +260,48 @@ def run_sniffer3() -> None:
                         orig_msg_id = radar_states[state_key]['msg_id']
                         setup_id = radar_states[state_key]['setup_id']
                         
+                        # --- UUSI: STAIR-STEP LOGIIKKA (JATKUVAN RAKENTEEN PÄIVITYS) ---
+                        # Tarkistetaan, onko odotuksen aikana muodostunut UUSI murtuma (Stair-step)
+                        new_bull_bos, new_bear_bos, new_res, new_sup, new_bos_time = detect_bos_structure(highs, lows, closes, times, LEFT_SWING_BARS, RIGHT_SWING_BARS)
+                        
+                        if direction == 'BULL' and new_bull_bos and new_bos_time > bos_time and new_res > target_level:
+                            # Markkina teki "portaan" ylöspäin! Päivitetään seurattava taso uuteen (keltainen viiva)
+                            logger.info(f"[{symbol} {tf_name}] STAIR-STEP BULL: Taso päivitetty {target_level:.5f} -> {new_res:.5f}")
+                            radar_states[state_key] = {'state': 'BOS_PENDING', 'level': new_res, 'dir': 'BULL', 'bos_time': new_bos_time, 'breakout_peak': live_price, 'pullback_extreme': live_price, 'msg_id': orig_msg_id, 'setup_id': setup_id}
+                            
+                            msg = (f"📈 <b>Sniffer3: STAIR-STEP PÄIVITYS</b>\n"
+                                   f"Tunniste: {setup_id}\n\n"
+                                   f"<b>{symbol} {tf_name}</b> | 🟢 BULL JATKUU\n"
+                                   f"<b>Uusi Tuki:</b> <code>{new_res:.5f}</code>\n"
+                                   f"<i>Alkuperäinen BOS (sininen) hylätty. Momentum jatkuu, seurataan uutta ylempää porrasta (keltainen)...</i>")
+                            send_telegram_alert(msg, reply_to_msg_id=orig_msg_id)
+                            continue # Aloitetaan uuden tason seuranta heti uuden luupin alusta
+
+                        elif direction == 'BEAR' and new_bear_bos and new_bos_time > bos_time and new_sup < target_level:
+                            # Markkina teki "portaan" alaspäin!
+                            logger.info(f"[{symbol} {tf_name}] STAIR-STEP BEAR: Taso päivitetty {target_level:.5f} -> {new_sup:.5f}")
+                            radar_states[state_key] = {'state': 'BOS_PENDING', 'level': new_sup, 'dir': 'BEAR', 'bos_time': new_bos_time, 'breakout_peak': live_price, 'pullback_extreme': live_price, 'msg_id': orig_msg_id, 'setup_id': setup_id}
+                            
+                            msg = (f"📉 <b>Sniffer3: STAIR-STEP PÄIVITYS</b>\n"
+                                   f"Tunniste: {setup_id}\n\n"
+                                   f"<b>{symbol} {tf_name}</b> | 🔴 BEAR JATKUU\n"
+                                   f"<b>Uusi Vastus:</b> <code>{new_sup:.5f}</code>\n"
+                                   f"<i>Alkuperäinen BOS hylätty. Momentum jatkuu, seurataan uutta alempaa porrasta...</i>")
+                            send_telegram_alert(msg, reply_to_msg_id=orig_msg_id)
+                            continue
+
+                        # --- NORMAALI ODOTUSLOGIIKKA JATKUU ---
                         candles_passed = sum(1 for t in times if t >= bos_time) - 1
                         if candles_passed > MAX_WAIT_CANDLES:
                             radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
                             continue
 
                         min_pullback = 1.0 * pip_factor # Vähintään 1 pip vetäytyminen ("ei saa olla nolla")
+                        chop_tolerance = 1.5 * pip_factor # UUSI: Konsolidointi-toleranssi!
 
                         if direction == 'BULL':
-                            if live_price > radar_states[state_key]['breakout_peak']:
+                            # UUSI LOGIIKKA: Nollataan extreme vasta, kun tehdään oikeasti uusi merkittävä huippu, ei mikrosahauksesta.
+                            if live_price > radar_states[state_key]['breakout_peak'] + chop_tolerance:
                                 radar_states[state_key]['breakout_peak'] = live_price
                                 radar_states[state_key]['pullback_extreme'] = live_price
                             elif live_price < radar_states[state_key]['pullback_extreme']:
@@ -296,7 +336,8 @@ def run_sniffer3() -> None:
                                 radar_states[state_key] = {'state': 'IDLE', 'level': 0.0, 'dir': '', 'bos_time': bos_time, 'breakout_peak': 0.0, 'pullback_extreme': 0.0, 'msg_id': 0, 'setup_id': ''}
 
                         elif direction == 'BEAR':
-                            if live_price < radar_states[state_key]['breakout_peak']:
+                            # UUSI LOGIIKKA: Nollataan extreme vasta, kun tehdään oikeasti uusi merkittävä pohja.
+                            if live_price < radar_states[state_key]['breakout_peak'] - chop_tolerance:
                                 radar_states[state_key]['breakout_peak'] = live_price
                                 radar_states[state_key]['pullback_extreme'] = live_price
                             elif live_price > radar_states[state_key]['pullback_extreme']:
