@@ -1,0 +1,62 @@
+{
+    "EURUSD": {
+        "live_price": 1.13795,
+        "bsl_taso": 1.13828,
+        "ssl_taso": 1.13761,
+        "etaisyys_bsl": 3.3,
+        "etaisyys_ssl": 3.4,
+        "absorptio": "Normaali (Ei poikkeamaa)",
+        "status": "🔴 BSL UHKAVYÖHYKE",
+        "paivitetty": "01:29:44"
+    },
+    "GBPUSD": {
+        "live_price": 1.3198699999999999,
+        "bsl_taso": 1.32029,
+        "ssl_taso": 1.3189,
+        "etaisyys_bsl": 4.2,
+        "etaisyys_ssl": 9.7,
+        "absorptio": "Normaali (Ei poikkeamaa)",
+        "status": "🔴 BSL UHKAVYÖHYKE",
+        "paivitetty": "01:29:44"
+    },
+    "XAUUSD": {
+        "live_price": 4106.14,
+        "bsl_taso": 4143.76,
+        "ssl_taso": 4105.36,
+        "etaisyys_bsl": 376.2,
+        "etaisyys_ssl": 7.8,
+        "absorptio": "Normaali (Ei poikkeamaa)",
+        "status": "🟢 SSL UHKAVYÖHYKE",
+        "paivitetty": "01:29:44"
+    },
+    "BTCUSD": {
+        "live_price": 62606.1,
+        "bsl_taso": 62819.08,
+        "ssl_taso": 62090.85,
+        "etaisyys_bsl": 213.0,
+        "etaisyys_ssl": 515.2,
+        "absorptio": "Normaali (Ei poikkeamaa)",
+        "status": "Odottaa",
+        "paivitetty": "01:29:44"
+    },
+    "USDCAD": {
+        "live_price": 1.42123,
+        "bsl_taso": 1.42171,
+        "ssl_taso": 1.41689,
+        "etaisyys_bsl": 4.8,
+        "etaisyys_ssl": 43.4,
+        "absorptio": "Normaali (Ei poikkeamaa)",
+        "status": "🔴 BSL UHKAVYÖHYKE",
+        "paivitetty": "01:29:44"
+    },
+    "AUDUSD": {
+        "live_price": 0.69158,
+        "bsl_taso": 0.69173,
+        "ssl_taso": 0.69068,
+        "etaisyys_bsl": 1.5,
+        "etaisyys_ssl": 9.0,
+        "absorptio": "Normaali (Ei poikkeamaa)",
+        "status": "🔴 BSL UHKAVYÖHYKE",
+        "paivitetty": "01:29:44"
+    }
+}
